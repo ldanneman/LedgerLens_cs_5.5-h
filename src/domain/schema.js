@@ -413,8 +413,10 @@ export function normalizeDataset(raw) {
 
 // ----------------------------------------------------------- field validation
 /**
- * Declarative field specs. t: id | str | date | month | cents | int | bool | enum | tags | ids
+ * Declarative field specs. t: id | str | date | month | cents | int | bool | enum | stamp
  * required fields must be present and valid; optional ones may be null/undefined/''.
+ * `stamp` is a free-form timestamp TEXT (ISO strings in practice) shown to the user; it only has to be a string,
+ * so older or hand-made files are not rejected for their timestamp format, but never a number or object.
  */
 const S = {
   id: { t: 'id', req: true },
@@ -429,6 +431,7 @@ const S = {
   bool: { t: 'bool', req: true },
   enum: (values, req = true) => ({ t: 'enum', values, req }),
   oid: { t: 'id' },
+  stamp: { t: 'str', max: 40 },
 };
 
 export const FIELD_SPECS = {
@@ -533,6 +536,8 @@ export const FIELD_SPECS = {
     openingCents: S.cents,
     closingCents: S.cents,
     status: S.enum(['in_progress', 'completed']),
+    createdAt: S.stamp,
+    completedAt: S.stamp,
     calculatedCents: S.ocents,
     discrepancyCents: S.ocents,
     adjustmentTxId: S.oid,
@@ -542,10 +547,12 @@ export const FIELD_SPECS = {
     id: S.id,
     accountId: S.id,
     fileName: S.str(200),
+    importedAt: S.stamp,
+    undoneAt: S.stamp,
     status: S.enum(['committed', 'undone']),
-    rowCount: S.int(0, 10_000_000),
-    skippedCount: S.int(0, 10_000_000),
-    rejectedCount: S.int(0, 10_000_000),
+    rowCount: S.int(0, 10_000_000, true),
+    skippedCount: S.int(0, 10_000_000, true),
+    rejectedCount: S.int(0, 10_000_000, true),
   },
   scenarios: {
     id: S.id,
@@ -613,9 +620,12 @@ export function collectIds(list) {
  * Allocate the next ID for a collection inside an Immer draft (or plain object).
  * IDs look like "tx-000123"; the dataset-wide counter guarantees determinism and
  * the existence check guarantees uniqueness even for imported datasets.
+ * Callers allocating many ids in one recipe pass `taken` (a Set built once); each new id is added to it, so n
+ * allocations cost O(n) instead of re-reading the whole collection through the Immer draft every time.
+ * @param {object} data @param {string} prefix @param {string} collection @param {Set<string>} [taken]
  */
-export function allocId(data, prefix, collection) {
-  const ids = collectIds(data[collection]);
+export function allocId(data, prefix, collection, taken = null) {
+  const ids = taken || collectIds(data[collection]);
   let n = data.meta.seq;
   let id;
   do {
@@ -623,6 +633,7 @@ export function allocId(data, prefix, collection) {
     n += 1;
   } while (ids.has(id));
   data.meta.seq = n;
+  if (taken) taken.add(id);
   return id;
 }
 

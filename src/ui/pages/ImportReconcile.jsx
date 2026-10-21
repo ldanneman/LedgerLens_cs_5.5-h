@@ -4,10 +4,10 @@ import { useData, useRun, useStore } from '../../state/hooks.jsx';
 import { buildIndex, isLiabilityType } from '../../domain/ledger.js';
 import { parseCsv, detectDelimiter, IMPORT_LIMITS } from '../../imports/csv.js';
 import { FORMAT_PRESETS, DATE_FORMATS, defaultMapping, suggestMapping, normalizeRows, signHint } from '../../imports/mapping.js';
-import { matchRows, summarizePlan } from '../../imports/matching.js';
+import { matchRows, summarizePlan, settlementSplitPlan } from '../../imports/matching.js';
 import { commitImport, undoImportBatch } from '../../domain/ops/importing.js';
 import { suggestTransferPairs, linkAsTransfer } from '../../domain/ops/transactions.js';
-import { reconciliationCandidates, reconcileMath, suggestStatement, reconciliationHealth, diagnoseDiscrepancy, reconciledTxIds } from '../../domain/reconciliation.js';
+import { reconciliationCandidates, reconcileMath, suggestStatement, reconciliationHealth, diagnoseDiscrepancy, reconciledTxIds, safeSnapshots } from '../../domain/reconciliation.js';
 import { saveReconciliationDraft, completeReconciliation, reopenReconciliation, deleteReconciliation, addReconciliationAdjustment } from '../../domain/ops/reconcile.js';
 import { formatDate, monthEnd, monthStart, monthKey, addMonthKey } from '../../domain/dates.js';
 import { formatMoney, parseMoney, centsToDecimalString } from '../../domain/money.js';
@@ -67,6 +67,7 @@ function CsvImport() {
   const [presetId, setPresetId] = useState('generic');
   const [mapping, setMapping] = useState(defaultMapping());
   const [decisions, setDecisions] = useState({});
+  const [targets, setTargets] = useState({}); // line -> pending item the user picked to settle
   const [filter, setFilter] = useState('all');
   const [page, setPage] = useState(0);
   const [result, setResult] = useState(null);
@@ -95,13 +96,14 @@ function CsvImport() {
     const sug = suggestMapping(parsed.rows[0]);
     setMapping((m) => ({ ...defaultMapping(), ...sug, dateFormat: m.dateFormat, decimal: m.decimal, hasHeader: m.hasHeader, amountMode: preset?.id === 'debit-credit' ? 'debit_credit' : sug.amountMode, invertSign: preset ? preset.invertSign : false }));
     setDecisions({});
+    setTargets({});
     setPage(0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsed?.rows?.[0]?.join('|'), presetId]);
 
   const norm = useMemo(() => (parsed?.ok ? normalizeRows(parsed.rows, parsed.lines, mapping, { asOfDate: data.settings.asOfDate }) : null), [parsed, mapping, data.settings.asOfDate]);
   const matched = useMemo(() => (norm && !norm.blocking && accountId ? matchRows(data, accountId, norm.rows) : []), [norm, data, accountId]);
-  const rows = useMemo(() => matched.map((r) => ({ ...r, decision: decisions[r.line] })), [matched, decisions]);
+  const rows = useMemo(() => matched.map((r) => ({ ...r, decision: decisions[r.line], settleTxId: targets[r.line] })), [matched, decisions, targets]);
   const summary = useMemo(() => summarizePlan(rows), [rows]);
   const hint = acct && norm && !norm.blocking ? signHint(acct.type, norm.summary, mapping.invertSign) : null;
   const visible = rows.filter((r) => (filter === 'all' ? true : filter === 'attention' ? r.match.type === 'suspected' || r.match.type === 'in_file_duplicate' || r.warnings?.length || r.match.type === 'settles_pending' : filter === 'rejected' ? r.match.type === 'rejected' : r.match.type === filter));
@@ -145,6 +147,7 @@ function CsvImport() {
       remember('import-text', '');
       setText('');
       setDecisions({});
+      setTargets({});
     }
   };
   const pairs = result ? suggestTransferPairs(store.data()).filter((p) => store.data().importBatches.find((b) => b.id === result.batchId)?.createdTxIds.some((id) => id === p.outflow.id || id === p.inflow.id)) : [];
@@ -178,7 +181,7 @@ function CsvImport() {
 
         <Card title="1. Choose the account and file" className="step">
           <div className="form-grid">
-            <SelectField label="Destination account" value={accountId} onChange={(v) => { setAccountId(v); remember('import-acct', v); setDecisions({}); }} options={accounts.map((a) => ({ value: a.id, label: a.name }))} />
+            <SelectField label="Destination account" value={accountId} onChange={(v) => { setAccountId(v); remember('import-acct', v); setDecisions({}); setTargets({}); }} options={accounts.map((a) => ({ value: a.id, label: a.name }))} />
             <SelectField label="File layout" value={presetId} onChange={setPresetId} options={FORMAT_PRESETS.map((p) => ({ value: p.id, label: p.label }))} hint={FORMAT_PRESETS.find((p) => p.id === presetId)?.hint} />
             <label className="field">
               <span>CSV file (max {IMPORT_LIMITS.maxChars / 1024 / 1024} MB, {IMPORT_LIMITS.maxRows.toLocaleString('en-US')} rows)</span>
@@ -229,10 +232,10 @@ function CsvImport() {
               <Badge tone="warn">{summary.suspected} possible duplicates</Badge>
               <Badge tone="neg">{summary.rejected} rejected</Badge>
               <Badge>{summary.skipped} skipped</Badge>
-              {summary.attention > 0 && <Badge tone="warn">{summary.attention} with warnings</Badge>}
+              {summary.attention > 0 && <Badge tone="warn">{summary.attention} to review</Badge>}
             </div>
             <Explain summary="How duplicates are detected">
-              <p>A row with the same <strong>reference</strong> as an existing transaction in this account is the same bank record and is skipped. A different reference means a different purchase, even if date, amount and merchant match (two coffees are both kept). Without references, identical rows are matched by count, and anything that looks like an existing entry is flagged "Possible duplicate" and skipped by default; choose <em>Keep</em> to import it anyway. A posted row that resembles a pending item <em>settles</em> it instead of duplicating it.</p>
+              <p>A row with the same <strong>reference</strong> as an existing transaction in this account is the same bank record and is skipped. A different reference means a different purchase, even if date, amount and merchant match (two coffees are both kept). Without references, identical rows are matched by count, and anything that looks like an existing entry is flagged "Possible duplicate" and skipped by default; choose <em>Keep</em> to import it anyway. A posted row that resembles a pending item <em>settles</em> it instead of duplicating it - unless both carry references and they differ, which always means two separate purchases. Matches made by similarity rather than a shared reference are marked <em>similarity</em> for you to check; when several pending items look alike you choose which one. If the settled amount differs from the pending amount, the item's category splits are rescaled in proportion and still add up to the cent. A pending transfer is never settled from a file: post the transfer itself so both sides move together.</p>
             </Explain>
             <div className="row" style={{ margin: '10px 0' }}>
               <SelectField label="Show" value={filter} onChange={(v) => { setFilter(v); setPage(0); }} options={[{ value: 'all', label: 'All rows' }, { value: 'attention', label: 'Needs attention' }, { value: 'new', label: 'New' }, { value: 'duplicate', label: 'Already imported' }, { value: 'suspected', label: 'Possible duplicates' }, { value: 'settles_pending', label: 'Settles pending' }, { value: 'rejected', label: 'Rejected' }]} />
@@ -247,7 +250,7 @@ function CsvImport() {
                 { key: 'date', header: 'Date', className: 'nowrap', render: (r) => (r.date ? formatDate(r.date) : <span className="error-text">{r.raw[mapping.dateCol] || '-'}</span>) },
                 { key: 'desc', header: 'Description', main: true, render: (r) => (<div className="desc-cell"><div className="title">{r.description || <span className="muted">(empty)</span>}</div>{r.externalId && <div className="sub">Ref {r.externalId}</div>}{r.status === 'pending' && <Badge tone="warn">Pending</Badge>}{r.warnings?.map((w) => <div key={w} className="sub">Warning: {w}</div>)}</div>) },
                 { key: 'amt', header: 'Amount', className: 'num', render: (r) => (r.amountCents === null ? <span className="error-text">-</span> : <Money cents={r.amountCents} signed />) },
-                { key: 'result', header: 'Result', render: (r) => (<div><Badge tone={MATCH_BADGE[r.match.type].tone}>{MATCH_BADGE[r.match.type].label}</Badge>{r.match.reason && <div className="small muted">{r.match.reason}</div>}</div>) },
+                { key: 'result', header: 'Result', render: (r) => <MatchResult row={r} data={data} /> },
                 {
                   key: 'decision',
                   header: 'Action',
@@ -255,7 +258,20 @@ function CsvImport() {
                     if (r.match.type === 'rejected') return <span className="muted">Skipped</span>;
                     if (r.match.type === 'duplicate' || r.match.type === 'in_file_duplicate') return <span className="muted">Skip</span>;
                     const opts = r.match.type === 'settles_pending' ? [{ value: 'settle', label: 'Settle the pending item' }, { value: 'import', label: 'Import as new' }, { value: 'skip', label: 'Skip' }] : r.match.type === 'suspected' ? [{ value: 'skip', label: 'Skip (duplicate)' }, { value: 'import', label: 'Keep (separate purchase)' }] : [{ value: 'import', label: 'Import' }, { value: 'skip', label: 'Skip' }];
-                    return <select aria-label={`Action for line ${r.line}`} value={effectiveAction(r)} onChange={(e) => setDecisions((d) => ({ ...d, [r.line]: e.target.value }))} style={{ minHeight: 32 }}>{opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>;
+                    const candidates = r.match.alternatives?.length ? [r.match.existingTxId, ...r.match.alternatives] : null;
+                    if (candidates) {
+                      return (
+                        <div className="stack" style={{ gap: 6 }}>
+                          <select aria-label={`Action for line ${r.line}`} value={effectiveAction(r)} onChange={(e) => setDecisions((d) => ({ ...d, [r.line]: e.target.value }))} style={{ minHeight: 32, minWidth: 180 }}>{opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>
+                          {effectiveAction(r) === 'settle' && (
+                            <select aria-label={`Pending item settled by line ${r.line}`} value={targets[r.line] || r.match.existingTxId} onChange={(e) => setTargets((t) => ({ ...t, [r.line]: e.target.value }))} style={{ minHeight: 32, minWidth: 180 }}>
+                              {candidates.map((id) => { const t = data.transactions.find((x) => x.id === id); return <option key={id} value={id}>{t ? `${t.description} · ${formatDate(t.date)} · ${formatMoney(t.amountCents)}` : id}</option>; })}
+                            </select>
+                          )}
+                        </div>
+                      );
+                    }
+                    return <select aria-label={`Action for line ${r.line}`} value={effectiveAction(r)} onChange={(e) => setDecisions((d) => ({ ...d, [r.line]: e.target.value }))} style={{ minHeight: 32, minWidth: 180 }}>{opts.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>;
                   },
                 },
               ]}
@@ -275,6 +291,28 @@ function CsvImport() {
   );
 }
 
+/** Preview "Result" cell: match badge(s), the reason, and the exact split re-allocation when a settled amount changes. */
+function MatchResult({ row, data }) {
+  const m = row.match;
+  const picked = row.settleTxId && row.settleTxId !== m.existingTxId ? data.transactions.find((t) => t.id === row.settleTxId) : null;
+  const plan = picked ? settlementSplitPlan(picked, row.amountCents) : m.splitPlan;
+  const category = (id) => data.categories.find((c) => c.id === id)?.name || id;
+  return (
+    <div>
+      <Badge tone={MATCH_BADGE[m.type].tone}>{MATCH_BADGE[m.type].label}</Badge>
+      {m.basis === 'heuristic' && <Badge tone="warn" title="Matched by date, amount and description, not by a shared reference">similarity</Badge>}
+      {m.ambiguous && <Badge tone="warn">{m.alternatives.length + 1} candidates</Badge>}
+      {m.reason && <div className="small muted">{m.reason}</div>}
+      {plan && (
+        <div className="small" data-testid={`split-plan-${row.line}`}>
+          <strong>Splits after settling:</strong> {plan.after.map((x) => `${category(x.categoryId)} ${formatMoney(x.amountCents, { signed: true })}`).join(' · ')}
+          <span className="muted"> (was {plan.before.map((x) => formatMoney(x.amountCents, { signed: true })).join(' · ')}{plan.dropped.length ? `; ${plan.dropped.map((x) => category(x.categoryId)).join(', ')} dropped because its share rounds to $0.00` : ''})</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ---------------------------------------------------------------- reconcile
 function monthBounds(asOf) {
   const prev = addMonthKey(monthKey(asOf), -1);
@@ -285,10 +323,12 @@ function Reconcile() {
   const data = useData();
   const [params, setParams] = useSearchParams();
   const accounts = data.accounts.filter((a) => a.status === 'active');
-  const acctId = params.get('acct') || recall('recon-acct', accounts[0]?.id || '');
+  // a bookmarked or remembered account that no longer exists (or was archived) falls back to the first active one
+  const wanted = params.get('acct') || recall('recon-acct', '');
+  const acctId = accounts.some((a) => a.id === wanted) ? wanted : accounts[0]?.id || '';
   const recId = params.get('rec') || '';
   const setAcct = (v) => { remember('recon-acct', v); setParams({ acct: v }, { replace: true }); };
-  const rec = recId ? data.reconciliations.find((r) => r.id === recId) : null;
+  const rec = (recId && data.reconciliations.find((r) => r.id === recId && r.accountId === acctId)) || null;
   return (
     <>
       <PageHead title="Reconcile a statement">Compare your ledger to a bank or card statement, clear what matches, and finish only when the difference is exactly $0.00.</PageHead>
@@ -333,10 +373,11 @@ function ReconcileForm({ acctId, rec, onOpen }) {
   const closingCents = cl.ok ? sign * cl.cents : null;
   const candidates = useMemo(() => (completed ? [] : reconciliationCandidates(data, acctId, start, end, { includeEarlier: earlier, excludeReconId: rec?.id })), [data, acctId, start, end, earlier, completed, rec]);
   const validCleared = [...cleared].map((id) => index.txById.get(id)).filter((t) => t && t.accountId === acctId && t.status === 'posted');
+  const snapshots = completed ? safeSnapshots(rec) : [];
   const clearedList = completed ? rec.clearedTxIds.map((id) => index.txById.get(id)).filter(Boolean) : validCleared;
   const tableRows = completed ? clearedList : [...validCleared.filter((t) => !candidates.some((c) => c.id === t.id)), ...candidates].sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
   const pendingInRange = (index.txByAccount.get(acctId) || []).filter((t) => t.status === 'pending' && t.date >= start && t.date <= end);
-  const math = openingCents !== null && closingCents !== null ? reconcileMath(openingCents, closingCents, completed ? rec.snapshots.map((s) => s.amountCents) : clearedList.map((t) => t.amountCents)) : null;
+  const math = openingCents !== null && closingCents !== null ? reconcileMath(openingCents, closingCents, completed ? snapshots.map((x) => x.amountCents) : clearedList.map((t) => t.amountCents)) : null;
   const reconciled = useMemo(() => reconciledTxIds(data), [data]);
   const recurringById = useMemo(() => new Map(data.recurring.map((r) => [r.id, r])), [data.recurring]);
   const hints = math && !completed && math.discrepancy !== 0 ? diagnoseDiscrepancy(data, { accountId: acctId, startDate: start, endDate: end, clearedTxIds: [...cleared], discrepancyCents: math.discrepancy }) : [];
@@ -397,7 +438,7 @@ function ReconcileForm({ acctId, rec, onOpen }) {
           <TextField label="Note (optional)" value={note} onChange={setNote} disabled={completed} />
         </Card>
 
-        <Card title={completed ? `Cleared items (${rec.snapshots.length})` : `Posted transactions to clear (${tableRows.length})`}>
+        <Card title={completed ? `Cleared items (${snapshots.length})` : `Posted transactions to clear (${tableRows.length})`}>
           {!completed && (
             <div className="row" style={{ marginBottom: 8 }}>
               <button type="button" className="btn small" onClick={() => setCleared(new Set([...cleared, ...candidates.filter((c) => c.date >= start).map((c) => c.id)]))}>Clear all in period</button>
@@ -428,7 +469,7 @@ function ReconcileForm({ acctId, rec, onOpen }) {
         <Card title="Reconciliation math" role="region" aria-label="Reconciliation math">
           <div className="kv" aria-live="polite">
             <span>Opening statement balance</span><span>{openingCents === null ? '-' : <Money cents={openingCents} tone="none" />}</span>
-            <span>+ Cleared transactions ({completed ? rec.snapshots.length : clearedList.length})</span><span>{math ? <Money cents={math.clearedSum} signed tone="none" /> : '-'}</span>
+            <span>+ Cleared transactions ({completed ? snapshots.length : clearedList.length})</span><span>{math ? <Money cents={math.clearedSum} signed tone="none" /> : '-'}</span>
             <span><strong>= Calculated closing</strong></span><span>{math ? <strong><Money cents={math.calculated} tone="none" /></strong> : '-'}</span>
             <span>Statement closing balance</span><span>{closingCents === null ? '-' : <Money cents={closingCents} tone="none" />}</span>
             <span><strong>Discrepancy</strong></span>

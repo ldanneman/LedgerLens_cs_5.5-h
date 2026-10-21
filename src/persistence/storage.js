@@ -61,7 +61,7 @@ export function createStorage(backend) {
   };
   return {
     backend,
-    /** Load and validate a workspace. Returns {status:'ok'|'empty'|'corrupt'|'error', data?, raw?, reason?, findings?}. */
+    /** Load and validate a workspace. Returns {status:'ok'|'empty'|'corrupt'|'error', data?, raw?, reason?, findings?, candidate?}; `candidate` is the normalized but invalid dataset, used only to offer explicit repairs. */
     loadWorkspace(id) {
       const r = read(KEYS.workspace(id));
       if (!r.ok) return { status: 'error', reason: r.error };
@@ -81,7 +81,7 @@ export function createStorage(backend) {
       const data = normalizeDataset(mig.raw);
       const findings = validateStructure(data);
       const sum = summarizeFindings(findings);
-      if (!sum.ok) return { status: 'corrupt', raw: r.value, reason: `The saved data failed validation (${sum.errors.length} blocking problem${sum.errors.length === 1 ? '' : 's'}): ${sum.errors[0].message}`, findings };
+      if (!sum.ok) return { status: 'corrupt', raw: r.value, reason: `The saved data failed validation (${sum.errors.length} blocking problem${sum.errors.length === 1 ? '' : 's'}): ${sum.errors[0].message}`, findings, candidate: data };
       return { status: 'ok', data, savedAt: env.savedAt || null };
     },
     /** Save a workspace. Returns {ok:true} or {ok:false, error}. */

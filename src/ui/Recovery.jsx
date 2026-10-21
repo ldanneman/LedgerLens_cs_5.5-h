@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useStore } from '../state/hooks.jsx';
 import { downloadText, readFileText } from './format.js';
 import { parseImportText, MAX_IMPORT_CHARS } from '../persistence/serialize.js';
+import RepairPanel from './components/RepairPanel.jsx';
 
 /** Shown instead of the app when saved data cannot be read. Nothing is overwritten until the user chooses. */
 export default function Recovery({ recovery }) {
@@ -33,6 +34,7 @@ export default function Recovery({ recovery }) {
         <p className="small">The unreadable data is still stored exactly as it was. Choose how to continue:</p>
       </div>
       <div className="stack" style={{ marginTop: 16 }}>
+        <RepairPanel candidate={recovery.candidate} onRepaired={(dataset, summary) => setDone(store.resolveRecovery('repair', dataset, summary))} />
         <section className="card">
           <h2>1. Keep a copy of the unreadable data</h2>
           <p>Download it so you (or someone helping you) can inspect or repair it.</p>

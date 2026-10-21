@@ -100,11 +100,18 @@ export function parseImportText(text) {
   const mig = migrateDataset(rawDataset, sv);
   if (!mig.ok) return { ok: false, error: mig.error, findings: [], notes, versionInfo };
   notes.push(...mig.notes);
-  const dataset = normalizeDataset(mig.raw);
+  return previewDataset(normalizeDataset(mig.raw), notes, versionInfo);
+}
+
+/**
+ * Validate a normalized dataset into an import preview. When it fails, `dataset` is undefined (nothing can be
+ * applied) and `candidate` holds the normalized data so the UI can offer the explicit repairs in repairs.js.
+ */
+export function previewDataset(dataset, notes = [], versionInfo = { formatVersion: null, schemaVersion: null }) {
   const findings = validateStructure(dataset);
   const sum = summarizeFindings(findings);
   if (!sum.ok) {
-    return { ok: false, error: `The dataset has ${sum.errors.length} blocking problem${sum.errors.length === 1 ? '' : 's'}; nothing was changed.`, dataset: undefined, findings, notes, versionInfo, summary: summarizeDataset(dataset) };
+    return { ok: false, error: `The dataset has ${sum.errors.length} blocking problem${sum.errors.length === 1 ? '' : 's'}; nothing was changed.`, dataset: undefined, candidate: dataset, findings, notes, versionInfo, summary: summarizeDataset(dataset) };
   }
   return { ok: true, dataset, findings, notes, versionInfo, summary: summarizeDataset(dataset) };
 }

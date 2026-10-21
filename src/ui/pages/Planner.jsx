@@ -257,6 +257,7 @@ function Results({ data, result, draft, otherName, month, setMonth }) {
             { key: 'e', header: 'Expenses', className: 'num', render: (m) => formatMoney(m.expensesCents) },
             { key: 'int', header: 'Debt interest', className: 'num', render: (m) => formatMoney(m.interestPaidCents) },
             { key: 'g', header: 'Market growth', className: 'num', render: (m) => formatMoney(m.growthCents) },
+            ...(b.monthly.some((m) => m.openingCents) ? [{ key: 'op', header: 'Accounts opening', className: 'num', render: (m) => formatMoney(m.openingCents) }] : []),
             { key: 'n', header: 'Net worth', className: 'num', render: (m) => <Money cents={m.netWorthCents} tone="none" /> },
             { key: 'l', header: 'Cash & savings', className: 'num', render: (m) => <Money cents={m.liquidCents} /> },
             { key: 'd', header: 'Debt', className: 'num', render: (m) => formatMoney(m.debtCents) },
@@ -281,7 +282,7 @@ function Results({ data, result, draft, otherName, month, setMonth }) {
               ]}
               empty={<span className="muted">No events this month.</span>}
             />
-            <p className="small muted">{evA.length} events in the same month for {otherName}. Order on a single day: income, then expenses, then transfers, then debt interest and payments, then month-end interest and growth.</p>
+            <p className="small muted">{evA.length} events in the same month for {otherName}. Order on a single day: account openings, then income, then expenses, then transfers, then debt interest and payments, then month-end interest and growth.</p>
           </div>
         )}
       </Card>
@@ -289,8 +290,9 @@ function Results({ data, result, draft, otherName, month, setMonth }) {
         <ul>
           {b.notes.map((n, i) => <li key={i}>{n}</li>)}
           <li>The projection starts from each account's balance including pending items on {formatDate(b.asOfDate)}; future-dated ledger entries are included as events.</li>
+          <li>An account that opens after {formatDate(b.asOfDate)} enters once, on its opening date (an "opens" event, never income); scheduled items dated before it opens are not applied to it. Savings changes repeat every month from their effective date, however long ago that was.</li>
           <li>Recurring items already matched to a transaction are not counted twice. Paused items and skipped occurrences are ignored. Business-day adjustments follow each rule.</li>
-          <li>Debt interest is charged on each due date as balance × APR ÷ 12 (rounded to the cent) before that month's payment; payments never exceed what is owed. Interest is charged to cards and loans and shows as an expense.</li>
+          <li>Debt interest is charged on each due date as balance × APR ÷ 12 (rounded to the cent) before that month's payment; payments never exceed what is owed. A minimum payment is recalculated every month from the current balance - the same rule as the Debt page. Interest is charged to cards and loans and shows as an expense.</li>
           <li>Credit cards are paid from their pay-from account (or the primary checking) according to their payment mode. New card purchases other than recurring items are modeled as everyday spending from checking.</li>
           <li>Scenarios cannot post transactions. To act on a plan, record real transactions or recurring items yourself - committing a scenario to the ledger is not supported.</li>
         </ul>

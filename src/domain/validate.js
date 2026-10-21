@@ -23,6 +23,9 @@ import {
 import { isValidCents } from './money.js';
 import { isValidDate, isValidMonth } from './dates.js';
 import { validateChange } from '../forecast/changes.js';
+import { settlersOf, ownership, describeOwner } from './batches.js';
+
+const LIMITS_NOTES = 2000;
 
 /** Create a finding. */
 export function finding(severity, code, message, refs = []) {
@@ -60,7 +63,14 @@ function run(data, out) {
   }
   if (data.schemaVersion !== SCHEMA_VERSION) err('schema-version', `schemaVersion must be ${SCHEMA_VERSION} (found ${String(data.schemaVersion)}).`);
   if (!isObj(data.meta)) err('meta-missing', 'meta must be an object.');
-  else if (!Number.isSafeInteger(data.meta.seq) || data.meta.seq < 1) err('meta-seq', 'meta.seq must be a positive whole number.');
+  else {
+    if (!Number.isSafeInteger(data.meta.seq) || data.meta.seq < 1) err('meta-seq', 'meta.seq must be a positive whole number.');
+    // shown in the header and the Test Lab, so they must be text (an object here used to crash the page)
+    for (const [field, spec] of [['name', { t: 'str', req: true, max: 200 }], ['kind', { t: 'str', max: 40 }], ['presetId', { t: 'id' }], ['description', { t: 'str', max: LIMITS_NOTES }]]) {
+      const m = checkField(data.meta[field], spec, `meta.${field}`);
+      if (m) err('meta-field', m);
+    }
+  }
   if (!isObj(data.settings)) err('settings-missing', 'settings must be an object.');
   else {
     const m1 = checkField(data.settings.asOfDate, { t: 'date', req: true }, 'settings.asOfDate');
@@ -139,8 +149,11 @@ function run(data, out) {
       if (!isObj(t.source)) err('field-invalid', `${nm}: source must be an object.`, ref);
       else {
         if (!SOURCE_TYPES.includes(t.source.type)) err('field-invalid', `${nm}: source.type "${String(t.source.type)}" is not valid.`, ref);
-        if (t.source.externalId !== null && t.source.externalId !== undefined && typeof t.source.externalId !== 'string') err('field-invalid', `${nm}: source.externalId must be text.`, ref);
-        if (t.source.batchId && ok('importBatches') && !batches.has(t.source.batchId)) err('missing-ref', `${nm} references unknown import batch "${t.source.batchId}".`, ref);
+        for (const [field, spec] of [['externalId', { t: 'str', max: 120 }], ['batchId', { t: 'id' }], ['importedAt', { t: 'str', max: 40 }], ['rawDescription', { t: 'str', max: LIMITS_NOTES }]]) {
+          const m = checkField(t.source[field], spec, `${nm}: source.${field}`);
+          if (m) err('field-invalid', m, ref);
+        }
+        if (typeof t.source.batchId === 'string' && t.source.batchId && ok('importBatches') && !batches.has(t.source.batchId)) err('missing-ref', `${nm} references unknown import batch "${t.source.batchId}".`, ref);
       }
       if (t.recurrence) {
         if (!isObj(t.recurrence)) err('field-invalid', `${nm}: recurrence must be an object.`, ref);
@@ -179,6 +192,8 @@ function run(data, out) {
             sum += s.amountCents;
             if (typeof t.amountCents === 'number' && Math.sign(s.amountCents) !== Math.sign(t.amountCents)) err('split-sign', `${nm}: split #${i + 1} has the opposite sign to the transaction.`, ref);
           }
+          const noteMsg = checkField(s.note, { t: 'str', max: 200 }, `${nm}: split #${i + 1} note`);
+          if (noteMsg) err('field-invalid', noteMsg, ref);
           const sc = categories.get(s.categoryId);
           if (!s.categoryId) err('split-category', `${nm}: split #${i + 1} needs a category.`, ref);
           else if (ok('categories') && !sc) err('missing-category', `${nm}: split #${i + 1} references unknown category "${s.categoryId}".`, ref);
@@ -228,6 +243,9 @@ function run(data, out) {
           if (a.accountId === b.accountId) err('transfer-same-account', `Transfer "${tr.id}" has both legs in the same account.`, ref);
           if (isValidCents(a.amountCents) && isValidCents(b.amountCents) && a.amountCents + b.amountCents !== 0) {
             err('transfer-unbalanced', `Transfer "${tr.id}" does not balance: legs sum to ${a.amountCents + b.amountCents} cents instead of 0.`, [...ref, { type: 'transactions', id: a.id }, { type: 'transactions', id: b.id }]);
+          }
+          if (a.status !== b.status) {
+            err('transfer-status-mismatch', `Transfer "${tr.id}" is ${String(a.status)} on one side ("${a.description}", ${a.id}) and ${String(b.status)} on the other ("${b.description}", ${b.id}). Both legs of an internal transfer must share one status; otherwise posted balances and net worth are wrong by the transfer amount.`, [...ref, { type: 'transactions', id: a.id }, { type: 'transactions', id: b.id }]);
           }
           if (a.date !== b.date) info('transfer-dates', `Transfer "${tr.id}" legs are dated differently (${a.date} / ${b.date}).`, ref);
         }
@@ -295,47 +313,141 @@ function run(data, out) {
         const v = g.allocation.value;
         if (g.allocation.type === 'fixed' && !(isValidCents(v) && v >= 0)) err('field-invalid', `Goal "${g.name}": fixed allocation must be a non-negative amount in cents.`, ref);
         if (g.allocation.type === 'percent' && !(Number.isSafeInteger(v) && v >= 0 && v <= 10000)) err('field-invalid', `Goal "${g.name}": percent allocation must be 0-10000 basis points.`, ref);
+        if ((g.allocation.type === 'full' || g.allocation.type === 'manual') && v !== null && v !== undefined && !(Number.isSafeInteger(v) && v >= 0)) err('field-invalid', `Goal "${g.name}": allocation value must be a whole number (it is unused for a ${g.allocation.type} allocation; use 0).`, ref);
         if (g.allocation.type !== 'manual' && !g.accountId) err('field-invalid', `Goal "${g.name}" needs a linked account for a ${g.allocation.type} allocation.`, ref);
       }
       if (!Array.isArray(g.contributions)) err('field-invalid', `Goal "${g.name}": contributions must be an array.`, ref);
       else if (g.contributions.some((c) => !isObj(c) || !isValidDate(c.date) || !isValidCents(c.amountCents))) err('field-invalid', `Goal "${g.name}": a contribution has an invalid date or amount.`, ref);
+      else if (g.contributions.some((c) => checkField(c.note, { t: 'str', max: 200 }, 'note'))) err('field-invalid', `Goal "${g.name}": a contribution note must be text.`, ref);
     }
   }
 
   // --- reconciliations
+  // Completed-statement model: `clearedTxIds` and `snapshots` describe the SAME transactions (one snapshot per
+  // cleared id, copied when the statement was completed), opening + sum(snapshot amounts) = closing, discrepancy 0.
+  // Drafts carry no snapshots. Snapshots are history: a transaction edited, moved or deleted AFTER completion makes
+  // the statement stale (a warning here; "out of date" in reconciliationHealth) - that is not malformed data.
+  // A malformed snapshot is an error with its index; nothing is filtered out or counted as zero.
   if (ok('reconciliations') && ok('transactions')) {
     for (const r of data.reconciliations.filter(isObj)) {
       const ref = [{ type: 'reconciliations', id: r.id }];
-      if (ok('accounts') && r.accountId && !accounts.has(r.accountId)) err('missing-account', `Reconciliation "${r.id}" references unknown account "${r.accountId}".`, ref);
-      if (isValidDate(r.startDate) && isValidDate(r.endDate) && r.endDate < r.startDate) err('field-invalid', `Reconciliation "${r.id}": end date is before the start date.`, ref);
-      if (!Array.isArray(r.clearedTxIds) || r.clearedTxIds.some((x) => typeof x !== 'string')) {
-        err('field-invalid', `Reconciliation "${r.id}": clearedTxIds must be a list of transaction ids.`, ref);
+      const rid = `Reconciliation "${r.id}"`;
+      if (ok('accounts') && r.accountId && !accounts.has(r.accountId)) err('missing-account', `${rid} references unknown account "${r.accountId}".`, ref);
+      if (isValidDate(r.startDate) && isValidDate(r.endDate) && r.endDate < r.startDate) err('field-invalid', `${rid}: end date is before the start date.`, ref);
+      if (!Array.isArray(r.clearedTxIds) || r.clearedTxIds.some((x) => typeof x !== 'string' || x.trim() === '')) {
+        err('field-invalid', `${rid}: clearedTxIds must be a list of transaction ids.`, ref);
         continue;
       }
-      if (new Set(r.clearedTxIds).size !== r.clearedTxIds.length) err('field-invalid', `Reconciliation "${r.id}" lists the same transaction more than once.`, ref);
-      const snaps = Array.isArray(r.snapshots) ? new Map(r.snapshots.filter(isObj).map((s) => [s.txId, s])) : new Map();
+      if (new Set(r.clearedTxIds).size !== r.clearedTxIds.length) err('field-invalid', `${rid} lists the same transaction more than once.`, ref);
+      const snaps = new Map();
+      let snapSum = 0;
+      let snapsOk = Array.isArray(r.snapshots);
+      if (!snapsOk) err('recon-snapshot', `${rid}: snapshots must be a list (found ${r.snapshots === null ? 'null' : typeof r.snapshots}).`, ref);
+      else {
+        if (r.status !== 'completed' && r.snapshots.length) err('recon-snapshot', `${rid} is a draft but carries ${r.snapshots.length} snapshot(s); only completed reconciliations have snapshots.`, ref);
+        r.snapshots.forEach((x, i) => {
+          const at = `${rid}, snapshot #${i + 1}`;
+          if (!isObj(x)) {
+            err('recon-snapshot', `${at} must be an object (found ${x === null ? 'null' : Array.isArray(x) ? 'a list' : typeof x}).`, ref);
+            snapsOk = false;
+            return;
+          }
+          const bad = [];
+          if (typeof x.txId !== 'string' || x.txId.trim() === '') bad.push('txId must be a transaction id');
+          if (!isValidCents(x.amountCents) || x.amountCents === 0) bad.push(`amountCents must be a non-zero whole number of cents (found ${x.amountCents === undefined ? 'nothing' : JSON.stringify(x.amountCents)})`);
+          if (!isValidDate(x.date)) bad.push(x.date === undefined || x.date === null ? 'date is missing' : `date ${JSON.stringify(x.date)} is not a valid calendar date`);
+          if (x.status !== 'posted') bad.push(`status must be "posted" (only posted transactions can be cleared)`);
+          if (x.accountId !== null && x.accountId !== undefined && x.accountId !== r.accountId) bad.push(`accountId ${JSON.stringify(x.accountId)} is not the reconciliation's account`);
+          if (bad.length) {
+            err('recon-snapshot', `${at}: ${bad.join('; ')}.`, ref);
+            snapsOk = false;
+            return;
+          }
+          if (snaps.has(x.txId)) {
+            err('recon-snapshot', `${at}: transaction "${x.txId}" already has a snapshot.`, [...ref, { type: 'transactions', id: x.txId }]);
+            snapsOk = false;
+            return;
+          }
+          snaps.set(x.txId, x);
+          snapSum += x.amountCents;
+        });
+      }
+      if (r.status === 'completed' && snapsOk) {
+        const cleared = new Set(r.clearedTxIds);
+        for (const tid of r.clearedTxIds) if (!snaps.has(tid)) err('recon-snapshot', `${rid} is completed but cleared transaction "${tid}" has no snapshot, so later edits to it could not be detected.`, [...ref, { type: 'transactions', id: tid }]);
+        for (const tid of snaps.keys()) if (!cleared.has(tid)) err('recon-snapshot', `${rid} has a snapshot of "${tid}", which is not in its cleared list.`, [...ref, { type: 'transactions', id: tid }]);
+      }
       for (const tid of r.clearedTxIds) {
         const t = txs.get(tid);
+        const history = r.status === 'completed' && snaps.has(tid);
         if (!t) {
-          if (snaps.has(tid)) warn('recon-missing-tx', `Reconciliation "${r.id}" cleared transaction "${tid}", which no longer exists (it was deleted after reconciling).`, [...ref, { type: 'transactions', id: tid }]);
-          else err('recon-missing-tx', `Reconciliation "${r.id}" refers to unknown transaction "${tid}".`, [...ref, { type: 'transactions', id: tid }]);
+          if (history) warn('recon-missing-tx', `${rid} cleared transaction "${tid}", which no longer exists (it was deleted after reconciling).`, [...ref, { type: 'transactions', id: tid }]);
+          else err('recon-missing-tx', `${rid} refers to unknown transaction "${tid}".`, [...ref, { type: 'transactions', id: tid }]);
         } else if (t.accountId !== r.accountId) {
-          err('recon-wrong-account', `Reconciliation "${r.id}" clears "${tid}", which belongs to a different account.`, [...ref, { type: 'transactions', id: tid }]);
+          if (history) warn('recon-wrong-account', `${rid} cleared "${tid}", which was moved to another account after reconciling.`, [...ref, { type: 'transactions', id: tid }]);
+          else err('recon-wrong-account', `${rid} clears "${tid}", which belongs to a different account.`, [...ref, { type: 'transactions', id: tid }]);
         }
       }
       if (r.status === 'completed') {
-        if (r.discrepancyCents !== 0) err('recon-discrepancy', `Reconciliation "${r.id}" is marked completed but its discrepancy is ${String(r.discrepancyCents)} cents.`, ref);
-        if (Array.isArray(r.snapshots) && isValidCents(r.openingCents) && isValidCents(r.closingCents)) {
-          const sum = r.snapshots.reduce((s, x) => s + (isObj(x) && isValidCents(x.amountCents) ? x.amountCents : 0), 0);
-          if (r.openingCents + sum !== r.closingCents) err('recon-math', `Reconciliation "${r.id}": opening ${r.openingCents} + cleared ${sum} does not equal closing ${r.closingCents}.`, ref);
+        if (r.discrepancyCents !== 0) err('recon-discrepancy', `${rid} is marked completed but its discrepancy is ${String(r.discrepancyCents)} cents.`, ref);
+        if (snapsOk && isValidCents(r.openingCents) && isValidCents(r.closingCents)) {
+          if (r.openingCents + snapSum !== r.closingCents) err('recon-math', `${rid}: opening ${r.openingCents} + cleared ${snapSum} does not equal closing ${r.closingCents}.`, ref);
+          else if (r.calculatedCents !== null && r.calculatedCents !== undefined && r.calculatedCents !== r.closingCents) err('recon-math', `${rid}: calculated close ${String(r.calculatedCents)} does not equal the statement close ${r.closingCents}.`, ref);
         }
       }
     }
   }
+
+  // --- import batches (ownership rules: batches.js)
   if (ok('importBatches') && ok('accounts')) {
+    const settlers = settlersOf(data.importBatches);
+    const claimedBy = new Map(); // txId -> committed batch that lists it as created
     for (const b of data.importBatches.filter(isObj)) {
-      if (b.accountId && !accounts.has(b.accountId)) err('missing-account', `Import batch "${b.id}" references unknown account "${b.accountId}".`, [{ type: 'importBatches', id: b.id }]);
-      if (!Array.isArray(b.createdTxIds)) err('field-invalid', `Import batch "${b.id}": createdTxIds must be an array.`, [{ type: 'importBatches', id: b.id }]);
+      const ref = [{ type: 'importBatches', id: b.id }];
+      const bid = `Import batch "${b.id}"`;
+      if (b.accountId && !accounts.has(b.accountId)) err('missing-account', `${bid} references unknown account "${b.accountId}".`, ref);
+      const listOk = Array.isArray(b.createdTxIds) && b.createdTxIds.every((x) => typeof x === 'string' && x.trim() !== '');
+      if (!listOk) err('field-invalid', `${bid}: createdTxIds must be a list of transaction ids.`, ref);
+      else if (new Set(b.createdTxIds).size !== b.createdTxIds.length) err('batch-ownership', `${bid} lists the same created transaction more than once.`, ref);
+      const created = new Set(listOk ? b.createdTxIds : []);
+      if (!Array.isArray(b.settled)) err('field-invalid', `${bid}: settled must be a list (found ${b.settled === null ? 'null' : typeof b.settled}).`, ref);
+      else {
+        const seen = new Set();
+        b.settled.forEach((x, i) => {
+          const at = `${bid}, settled #${i + 1}`;
+          if (!isObj(x)) return err('batch-settled', `${at} must be an object.`, ref);
+          if (typeof x.txId !== 'string' || x.txId.trim() === '') return err('batch-settled', `${at}: txId must be a transaction id.`, ref);
+          if (seen.has(x.txId)) err('batch-settled', `${at}: "${x.txId}" is listed twice.`, ref);
+          seen.add(x.txId);
+          if (created.has(x.txId)) err('batch-ownership', `${bid} lists "${x.txId}" as both created and settled.`, ref);
+          if (!isObj(x.before)) return err('batch-settled', `${at} ("${x.txId}"): before must be the pending transaction as it was before the import.`, ref);
+          const bf = x.before;
+          const bad = [];
+          for (const [field, spec] of Object.entries(FIELD_SPECS.transactions)) {
+            const m = checkField(bf[field], spec, field);
+            if (m) bad.push(m);
+          }
+          if (bf.id !== x.txId) bad.push(`its id ${JSON.stringify(bf.id)} is not "${x.txId}"`);
+          if (b.accountId && bf.accountId !== b.accountId) bad.push("it is not in the batch's account");
+          if (bf.status !== 'pending') bad.push('only a pending transaction can have been settled');
+          if (!Array.isArray(bf.splits) || bf.splits.some((y) => !isObj(y) || !isValidCents(y.amountCents))) bad.push('splits must be a list of whole-cent amounts');
+          else if (bf.splits.length && bf.splits.reduce((sum, y) => sum + y.amountCents, 0) !== bf.amountCents) bad.push('its splits do not add up to its amount');
+          if (!isObj(bf.source)) bad.push('source must be an object');
+          if (bad.length) err('batch-settled', `${at} ("${x.txId}"): ${bad.slice(0, 3).join('; ')}.`, ref);
+          const live = txs.get(x.txId);
+          if (b.status === 'committed' && live && ownership(b.id, live, settlers) === 'foreign') err('batch-ownership', `${bid} says it settled "${x.txId}" ("${live.description}"), but that transaction is ${describeOwner(live)}; undoing the batch would overwrite it.`, [...ref, { type: 'transactions', id: x.txId }]);
+          return undefined;
+        });
+      }
+      if (listOk && b.status === 'committed' && ok('transactions')) {
+        for (const id of b.createdTxIds) {
+          const other = claimedBy.get(id);
+          if (other && other !== b.id) err('batch-ownership', `Transaction "${id}" is listed as created by two import batches ("${other}" and "${b.id}").`, [...ref, { type: 'transactions', id }]);
+          claimedBy.set(id, b.id);
+          const live = txs.get(id);
+          if (live && ownership(b.id, live, settlers) === 'foreign') err('batch-ownership', `${bid} lists "${id}" ("${live.description}") as created by the import, but that transaction is ${describeOwner(live)}. Undoing the batch would delete an unrelated record.`, [...ref, { type: 'transactions', id }]);
+        }
+      }
     }
   }
 
@@ -355,6 +467,8 @@ function run(data, out) {
         const v = s.assumptions.variableSpending;
         if (!['trailing', 'none', 'custom'].includes(v)) err('field-invalid', `Scenario "${s.name}": variable spending mode must be trailing, none or custom.`, ref);
         if (v === 'custom' && !(isValidCents(s.assumptions.variableSpendingCents) && s.assumptions.variableSpendingCents >= 0)) err('field-invalid', `Scenario "${s.name}": custom variable spending needs a non-negative monthly amount.`, ref);
+        else if (s.assumptions.variableSpendingCents !== null && s.assumptions.variableSpendingCents !== undefined && !isValidCents(s.assumptions.variableSpendingCents)) err('field-invalid', `Scenario "${s.name}": variable spending amount must be whole cents or empty.`, ref);
+        if (typeof s.assumptions.includeSavingsInterest !== 'boolean') err('field-invalid', `Scenario "${s.name}": includeSavingsInterest must be true or false.`, ref);
       }
       const cids = new Set();
       s.changes.forEach((c, i) => {

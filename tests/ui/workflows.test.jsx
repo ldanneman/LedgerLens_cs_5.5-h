@@ -192,7 +192,6 @@ describe('reconciliation workflow', () => {
 
 describe('budgets workflow', () => {
   it('shows the rollover chain (Case E) and recalculates after editing January spending', async () => {
-    const user = userEvent.setup();
     const { store } = withMain(caseE(), '/budgets/cat-groceries?month=2026-03');
     const table = await screen.findByRole('table', { name: 'Groceries by month' });
     const row = (m) => within(table).getAllByRole('row').find((r) => within(r).queryByText(m));
@@ -203,7 +202,9 @@ describe('budgets workflow', () => {
       store.apply((d) => updateTransaction(d, 'e1', { amountCents: -10000 }));
     });
     await waitFor(() => expect(row('March 2026')).toHaveTextContent('$220.00'));
-    expect(user).toBeTruthy();
+    // January now spends $100 of $200: $100 carries over, so February has $300 available; $280 spent leaves $20
+    // for March: $200 + $20 = $220.
+    expect(row('February 2026')).toHaveTextContent('$300.00');
   });
 
   it('creating a budget from the month view validates and saves', async () => {
@@ -394,5 +395,215 @@ describe('keyboard and accessibility behaviour', () => {
     renderApp('/transactions');
     const amounts = screen.getAllByRole('row').slice(1, 6).map((r) => r.textContent);
     expect(amounts.every((t) => /[+-]\$[\d,]+\.\d\d/.test(t))).toBe(true);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// Review remediation through the real UI: controls -> commit -> unmount/remount (reload) -> exact records
+// ------------------------------------------------------------------------------------------------
+import { DatasetBuilder, usd } from '../../src/seed/builder.js';
+import { runProjection } from '../../src/forecast/engine.js';
+
+/** Persist `dataset` as the saved My finances workspace and return the storage backend (a stand-in for localStorage). */
+function saved(dataset) {
+  const backend = createMemoryBackend();
+  makeStore(backend).store.replaceWorkspace('main', dataset, 'seed');
+  return backend;
+}
+const open = (backend, route) => renderApp(route, makeStore(backend));
+const postedNetWorth = (d) => netWorthAt(buildIndex(d), d.settings.asOfDate, false).netWorth;
+const paste = (text) => fireEvent.change(screen.getByLabelText('...or paste CSV text'), { target: { value: text } });
+function pendingCardPayment() {
+  const b = new DatasetBuilder({ name: 'R1 UI', asOfDate: '2026-01-31' });
+  b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+  b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+  b.transfer({ id: 'xr1', legIds: ['r1a', 'r1b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status: 'pending', desc: 'Card payment' });
+  return b.build();
+}
+
+describe('R1 in the UI', () => {
+  it('Mark posted on ONE selected leg posts both legs, says so, keeps posted net worth at $1,000.00, and survives a reload', async () => {
+    const user = userEvent.setup();
+    const backend = saved(pendingCardPayment());
+    const first = open(backend, '/transactions');
+    await user.click(screen.getByLabelText('Select row r1a'));
+    await user.click(screen.getByRole('button', { name: 'Mark posted' }));
+    expect(await screen.findByText(/1 transfer leg on the other side/)).toBeInTheDocument();
+    expect(first.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+    expect(postedNetWorth(first.store.data())).toBe(100000);
+    first.unmount();
+    const second = open(backend, '/transactions');
+    expect(second.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+    await user.click(screen.getByLabelText('Select row r1b'));
+    await user.click(screen.getByRole('button', { name: 'Mark pending' }));
+    await waitFor(() => expect(second.store.data().transactions.map((t) => t.status)).toEqual(['pending', 'pending']));
+    expect(postedNetWorth(second.store.data())).toBe(100000);
+  });
+});
+
+describe('R1 legacy data in the UI: the Recovery screen asks, then repairs', () => {
+  it('lists the transfer, waits for an explicit keyboard-operable choice, repairs, keeps a backup, and loads after reload', async () => {
+    const user = userEvent.setup();
+    const data = JSON.parse(JSON.stringify(pendingCardPayment()));
+    data.transactions[0].status = 'posted';
+    const raw = JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: 'x', workspace: 'main', data });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    const first = open(backend, '/');
+    expect(await screen.findByRole('heading', { name: /Repair transfers with mismatched status/ })).toBeInTheDocument();
+    const group = screen.getByRole('group', { name: 'Transfer xr1' });
+    expect(group).toHaveTextContent(/Checking: Card payment.*-\$50\.00 - posted/);
+    expect(group).toHaveTextContent(/Card: Card payment.*\+\$50\.00 - pending/);
+    const apply = screen.getByRole('button', { name: /Apply repairs \(0 of 1 chosen\)/ });
+    expect(apply).toBeDisabled();
+    within(group).getByLabelText('Both posted').focus();
+    await user.keyboard(' '); // keyboard selection of the radio
+    expect(within(group).getByLabelText('Both posted')).toBeChecked();
+    expect(backend.getItem(KEYS.workspace('main'))).toBe(raw); // still nothing written
+    await user.click(screen.getByRole('button', { name: /Apply repairs \(1 of 1 chosen\)/ }));
+    expect(await screen.findByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+    expect(first.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+    expect(first.store.storage.listCorruptBackups().map((k) => backend.getItem(k))).toContain(raw);
+    first.unmount();
+    expect(open(backend, '/').store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+  });
+});
+
+describe('R2 / R5 in the UI', () => {
+  const pendingWith = (tx) => {
+    const b = new DatasetBuilder({ name: 'import UI', asOfDate: '2026-09-30' });
+    b.category('cat-groceries', 'Groceries', 'expense');
+    b.category('cat-household', 'Household', 'expense');
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-09-01' });
+    for (const t of tx) b.tx({ account: 'chk', kind: 'expense', status: 'pending', ...t });
+    return b.build();
+  };
+  const coffee = (id, ext, date = '2026-09-15') => ({ id, date, desc: 'Review Coffee', merchant: 'Review Coffee', amount: -475, source: ext ? { type: 'import', batchId: null, externalId: ext, importedAt: null, rawDescription: null } : undefined });
+  it('a different reference defaults to New, commits as a second purchase, survives reload, and a reimport adds nothing', async () => {
+    const user = userEvent.setup();
+    const backend = saved(pendingWith([coffee('p1', 'P1')]));
+    const first = open(backend, '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount,Reference\n2026-09-16,Review Coffee,-4.75,P2\n');
+    expect(await screen.findByText('1 to import')).toBeInTheDocument();
+    expect(screen.getByText('0 settle pending')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    expect(await screen.findByText(/Import committed/)).toBeInTheDocument();
+    first.unmount();
+    const second = open(backend, '/import');
+    expect(second.store.data().transactions.map((t) => [t.status, t.amountCents, t.source.externalId])).toEqual([['pending', -475, 'P1'], ['posted', -475, 'P2']]);
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount,Reference\n2026-09-16,Review Coffee,-4.75,P2\n');
+    expect(await screen.findByText('1 already imported')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Commit import/ })).toBeDisabled();
+  });
+  it('a similarity match with two candidates is flagged; the keyboard-operable picker chooses which pending item to settle', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(pendingWith([coffee('p1', null, '2026-09-14'), coffee('p2', null, '2026-09-15')]), '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount\n2026-09-15,Review Coffee,-4.75\n');
+    expect(await screen.findByText('2 candidates')).toBeInTheDocument();
+    expect(within(screen.getByRole('region', { name: 'Import preview' })).getByText('similarity')).toBeInTheDocument();
+    expect(screen.getByText('1 to review')).toBeInTheDocument();
+    const picker = screen.getByLabelText('Pending item settled by line 2');
+    expect(picker).toHaveValue('p2');
+    picker.focus();
+    await user.keyboard('{ArrowDown}');
+    fireEvent.change(picker, { target: { value: 'p1' } }); // jsdom does not move a native <select> on arrow keys
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    await waitFor(() => expect(store.data().transactions.find((t) => t.id === 'p1').status).toBe('posted'));
+    expect(store.data().transactions.find((t) => t.id === 'p2').status).toBe('pending');
+  });
+  it('a changed amount shows the rescaled splits; commit, reload and undo keep them exact', async () => {
+    const user = userEvent.setup();
+    const d0 = pendingWith([{ id: 'sp', date: '2026-09-15', desc: 'Fresh Fields', merchant: 'Fresh Fields', amount: -1000, splits: [['cat-groceries', -600], ['cat-household', -400]] }]);
+    const backend = saved(d0);
+    const first = open(backend, '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount\n2026-09-16,Fresh Fields,-11.00\n');
+    expect(await screen.findByTestId('split-plan-2')).toHaveTextContent('Splits after settling: Groceries -$6.60 · Household -$4.40 (was -$6.00 · -$4.00)');
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    expect(await screen.findByText(/Import committed/)).toBeInTheDocument();
+    first.unmount();
+    const second = open(backend, '/import/history');
+    const tx = second.store.data().transactions[0];
+    expect([tx.status, tx.amountCents, tx.splits.map((s) => s.amountCents)]).toEqual(['posted', -1100, [-660, -440]]);
+    expect(postedNetWorth(second.store.data())).toBe(100000 - 1100);
+    await user.click(within(screen.getByRole('row', { name: /pasted\.csv/ })).getByRole('button', { name: 'Undo' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Undo batch' }));
+    await waitFor(() => expect(second.store.data().importBatches[0].status).toBe('undone'));
+    expect(second.store.data().transactions).toEqual(d0.transactions);
+  });
+});
+
+describe('R3 / R4 through the real JSON upload flow', () => {
+  const upload = async (user, dataset) => user.upload(screen.getByLabelText('Choose a LedgerLens export file'), new File([exportDatasetJson(dataset)], 'tampered.json', { type: 'application/json' }));
+  it.each([
+    ['a null reconciliation snapshot', (d) => { d.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-09-01', endDate: '2026-09-30', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] }); }, /snapshot #1 must be an object \(found null\)/],
+    ['a batch claiming a manual transaction', (d) => { d.importBatches.push({ id: 'batch-1', accountId: 'chk', status: 'committed', createdTxIds: ['d1'], settled: [] }); }, /Undoing the batch would delete an unrelated record/],
+    ['a dataset name that is an object', (d) => { d.meta.name = { x: 1 }; }, /meta.name must be text/],
+  ])('%s is refused with the reason; My finances is untouched', async (_n, corrupt, reason) => {
+    const user = userEvent.setup();
+    const { store } = withMain(caseD(), '/settings');
+    const before = JSON.stringify(store.dataOf('main'));
+    const bad = JSON.parse(JSON.stringify(caseD()));
+    corrupt(bad);
+    await upload(user, bad);
+    expect(await screen.findByText(/Not importable/)).toBeInTheDocument();
+    expect(screen.getByText(reason)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Replace My finances with this file' })).toBeNull();
+    expect(JSON.stringify(store.dataOf('main'))).toBe(before);
+  });
+  it('a mixed-status file can be repaired explicitly in the preview, then imported normally', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(caseD(), '/settings');
+    const bad = JSON.parse(JSON.stringify(pendingCardPayment()));
+    bad.transactions[1].status = 'posted';
+    await upload(user, bad);
+    expect(await screen.findByText(/Not importable/)).toBeInTheDocument();
+    await user.click(within(screen.getByRole('group', { name: 'Transfer xr1' })).getByLabelText('Both pending'));
+    await user.click(screen.getByRole('button', { name: /Apply repairs/ }));
+    expect(await screen.findByText(/Valid\./)).toBeInTheDocument();
+    expect(screen.getByText(/Repaired 1 transfer/)).toBeInTheDocument();
+    await user.click(screen.getByLabelText('Download a backup of my current data first'));
+    await user.click(screen.getByRole('button', { name: 'Replace My finances with this file' }));
+    await user.click(within(dialog()).getByRole('button', { name: 'Replace my data' }));
+    await waitFor(() => expect(store.dataOf('main').transactions.map((t) => t.status)).toEqual(['pending', 'pending']));
+  });
+  it('a malformed snapshot in SAVED storage opens Recovery instead of crashing Reconcile, keeping the raw text', async () => {
+    const bad = JSON.parse(JSON.stringify(caseD()));
+    bad.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-09-01', endDate: '2026-09-30', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] });
+    const raw = JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: 'x', workspace: 'main', data: bad });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    open(backend, '/import/reconcile?acct=chk');
+    expect(await screen.findByRole('heading', { name: /could not read your saved data/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Cannot read properties/)).toBeNull();
+    expect(backend.getItem(KEYS.workspace('main'))).toBe(raw);
+  });
+});
+
+describe('R8 in the UI', () => {
+  it('the Debt page states the minimum policy, shows $40.00 then $39.20, and labels the fixed-payment what-if; the forecast agrees', async () => {
+    const b = new DatasetBuilder({ name: 'R8 UI', asOfDate: '2026-10-01' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('50000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: -usd('1000.00'), openingDate: '2026-01-01', aprBps: 2400, paymentMode: 'minimum', minPaymentBps: 200, minPaymentFloor: usd('25.00'), dueDay: 15, autopay: 'chk' });
+    const d = b.build();
+    withMain(d, '/goals/debt');
+    expect(await screen.findByTestId('payment-assumption')).toHaveTextContent(/Minimum payment, recalculated every month: the larger of \$25\.00 and that month's interest plus 2(\.00)?% of the balance/);
+    const rows = within(screen.getByRole('table', { name: /Payment schedule for Card/ })).getAllByRole('row');
+    expect(within(rows[1]).getAllByRole('cell').map((c) => c.textContent)).toEqual(['1', 'Oct 15, 2026', '$1,000.00', '$20.00', '$20.00', '$40.00', '$980.00']);
+    expect(within(rows[2]).getAllByRole('cell').map((c) => c.textContent)).toEqual(['2', 'Nov 15, 2026', '$980.00', '$19.60', '$19.60', '$39.20', '$960.40']);
+    expect(screen.getByTestId('fixed-whatif')).toHaveTextContent(/What-if, not your plan: paying a fixed \$40\.00/);
+    expect(runProjection(d, null).events.filter((e) => e.kind === 'debt_payment').slice(0, 2).map((e) => e.legs[1].cents)).toEqual([4000, 3920]);
+  });
+});
+
+describe('X4: stale links do not crash pages', () => {
+  it('Reconcile with an unknown account (and a reconciliation id from nowhere) falls back to the first active account', async () => {
+    withMain(caseD(), '/import/reconcile?acct=ghost&rec=also-ghost');
+    expect(await screen.findByRole('heading', { name: 'Reconcile a statement' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Account')).toHaveValue('chk');
+    expect(screen.queryByText(/hit a problem/)).toBeNull();
   });
 });

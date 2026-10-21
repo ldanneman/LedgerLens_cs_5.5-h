@@ -7,6 +7,9 @@
  * structural validator on the RESULT; if it contains any blocking finding the whole
  * operation is rejected and the caller keeps the previous dataset. That makes every
  * mutation atomic (all-or-nothing) and keeps invalid data from ever being "saved".
+ *
+ * Between the recipe and validation, `tidyDrafts` keeps in-progress reconciliations consistent with
+ * the ledger (see below); completed reconciliations are history and are never rewritten.
  */
 import { produce } from 'immer';
 import { validateStructure } from '../validate.js';
@@ -38,9 +41,11 @@ export const fail = (...errors) => ({ ok: false, errors: errors.flat().map((x) =
 export function mutate(data, recipe) {
   let out = {};
   let next;
+  let tidied = 0;
   try {
     next = produce(data, (draft) => {
       out = recipe(draft) || {};
+      tidied = tidyDrafts(draft);
     });
   } catch (e) {
     if (e instanceof OpError) return { ok: false, errors: e.errors };
@@ -55,7 +60,33 @@ export function mutate(data, recipe) {
     };
   }
   const { warnings = [], ...extra } = out;
-  return { ok: true, data: next, warnings, ...extra };
+  const notes = tidied ? [`${tidied} draft reconciliation${tidied === 1 ? ' no longer lists' : 's no longer list'} items that were deleted, moved to another account or are no longer posted; the draft totals were recalculated.`] : [];
+  return { ok: true, data: next, warnings: [...warnings, ...notes], ...extra };
+}
+
+/**
+ * An in-progress reconciliation (a draft) may only clear posted transactions of its own account that exist.
+ * When a mutation deletes, moves or un-posts such a transaction, the draft drops it and recomputes its
+ * calculated close and discrepancy, instead of the whole mutation failing on a dangling reference.
+ * @param {object} draft Immer draft of a dataset @returns {number} number of drafts changed
+ */
+export function tidyDrafts(draft) {
+  if (!Array.isArray(draft.reconciliations) || !Array.isArray(draft.transactions)) return 0;
+  const byId = new Map(draft.transactions.map((t) => [t.id, t]));
+  let changed = 0;
+  for (const r of draft.reconciliations) {
+    if (r.status !== 'in_progress' || !Array.isArray(r.clearedTxIds)) continue;
+    const keep = r.clearedTxIds.filter((id) => {
+      const t = byId.get(id);
+      return t && t.accountId === r.accountId && t.status === 'posted';
+    });
+    if (keep.length === r.clearedTxIds.length) continue;
+    r.clearedTxIds = keep;
+    r.calculatedCents = r.openingCents + keep.reduce((sum, id) => sum + byId.get(id).amountCents, 0);
+    r.discrepancyCents = r.closingCents - r.calculatedCents;
+    changed += 1;
+  }
+  return changed;
 }
 
 /** Trim helper that tolerates non-strings. */

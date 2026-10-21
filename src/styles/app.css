@@ -732,6 +732,9 @@ input[type='radio'] {
 
 /* tables */
 .table-wrap {
+  /* positioned so absolutely positioned descendants (screen-reader-only labels in wide grids) stay inside this
+     scroll box instead of widening the whole page */
+  position: relative;
   overflow-x: auto;
   max-width: 100%;
   border: 1px solid var(--border);

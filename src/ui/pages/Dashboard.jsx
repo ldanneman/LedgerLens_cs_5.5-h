@@ -292,7 +292,7 @@ export default function Dashboard() {
                 </li>
               ))}
             </ul>
-            <p className="small muted">Payoff dates are planning projections from the scheduled payment, not lender quotes. Interest is estimated monthly.</p>
+            <p className="small muted">Payoff dates are planning projections under each account's payment policy (the same rule as the Scenario Planner), not lender quotes. Interest is estimated monthly.</p>
           </Card>
         </Boundary>
       </div>

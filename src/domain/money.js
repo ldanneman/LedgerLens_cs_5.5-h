@@ -70,10 +70,26 @@ export function allocateCents(total, weights) {
   let left = abs - base.reduce((a, b) => a + b, 0);
   rem.sort((x, y) => y.r - x.r || x.i - y.i);
   for (let k = 0; left > 0 && k < rem.length; k += 1, left -= 1) base[rem[k].i] += 1;
-  return base.map((v) => v * sign);
+  return base.map((v) => (v === 0 ? 0 : v * sign)); // never -0 (it would print as "-$0.00")
 }
 
 /** Sum an array of integer cents. */
+/**
+ * Re-allocate category splits to a new parent total in proportion to their current sizes, so they still add up
+ * EXACTLY (largest remainder; ties go to the earlier split). Order, categories and notes are kept and every piece
+ * takes the sign of the new total. A piece whose share rounds to zero is dropped (a zero split is invalid) and is
+ * returned in `dropped` so the caller can say so.
+ * Example: -600/-400 at -1100 -> -660/-440; -333/-333/-334 at -1001 -> -333/-333/-335.
+ * @param {Array<{categoryId:string, amountCents:number, note?:string}>} splits @param {number} newTotalCents non-zero
+ * @returns {{splits:Array, dropped:Array}}
+ */
+export function rescaleSplits(splits, newTotalCents) {
+  const shares = allocateCents(newTotalCents, splits.map((x) => Math.abs(x.amountCents)));
+  const out = { splits: [], dropped: [] };
+  splits.forEach((x, i) => (shares[i] === 0 ? out.dropped : out.splits).push({ ...x, amountCents: shares[i] }));
+  return out;
+}
+
 export function sumCents(list) {
   let t = 0;
   for (const v of list) t += v;

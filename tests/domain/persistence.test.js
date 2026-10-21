@@ -133,7 +133,9 @@ describe('JSON export and import', () => {
       const broken = c.apply(JSON.parse(JSON.stringify(base)));
       const r = parseImportText(JSON.stringify({ format: 'ledgerlens-export', formatVersion: 1, dataset: broken }));
       expect(r.ok, c.id).toBe(false);
-      expect(r.findings.some((f) => f.blocking) || r.error, c.id).toBeTruthy();
+      expect(r.dataset, c.id).toBeUndefined(); // nothing can be applied
+      expect(r.error, c.id).toMatch(/\S/); // every refusal says why (findings, or a parse/version error)
+      if (r.findings.length) expect(r.findings.filter((f) => f.blocking).length, c.id).toBeGreaterThan(0);
       if (c.expect) expect(r.findings.map((f) => f.message).concat(r.error).join(' | '), c.id).toMatch(c.expect);
     }
   });
@@ -315,5 +317,251 @@ describe('storage, corruption recovery and the real save/reload cycle', () => {
     };
     s.apply((d) => addTransaction(d, { accountId: 'acct-chk-main', date: '2026-09-20', description: 'x', amountCents: -1, kind: 'expense' }));
     expect(s.getState().saveError).toMatch(/Could not save/);
+  });
+});
+
+// ------------------------------------------------------------------------------------------------
+// R3 (review) and the same class of defect elsewhere: nested records are validated at the boundary
+// ------------------------------------------------------------------------------------------------
+import { DatasetBuilder, usd } from '../../src/seed/builder.js';
+import { reconciliationHealth, reconciledTxIds, safeSnapshots } from '../../src/domain/reconciliation.js';
+import { listTransferStatusRepairs, applyTransferStatusRepairs } from '../../src/domain/repairs.js';
+import { COLLECTIONS } from '../../src/domain/schema.js';
+import { DEFAULT_ASSUMPTIONS } from '../../src/forecast/engine.js';
+
+/** Checking with two posted transactions, both cleared in a completed reconciliation. */
+function reconciled() {
+  const b = new DatasetBuilder({ name: 'R3', asOfDate: '2026-01-31' });
+  b.category('cat-salary', 'Salary', 'income');
+  b.category('cat-rent', 'Rent', 'expense');
+  b.account('checking', { name: 'Checking', type: 'checking', opening: usd('500.00'), openingDate: '2026-01-01' });
+  b.account('other', { name: 'Other', type: 'checking', opening: 0, openingDate: '2026-01-01' });
+  b.tx({ id: 't1', account: 'checking', date: '2026-01-03', desc: 'Payroll', amount: usd('1200.00'), kind: 'income', category: 'cat-salary' });
+  b.tx({ id: 't2', account: 'checking', date: '2026-01-08', desc: 'Rent', amount: -usd('300.00'), kind: 'expense', category: 'cat-rent' });
+  return must(completeReconciliation(b.build(), { accountId: 'checking', startDate: '2026-01-01', endDate: '2026-01-31', openingCents: 50000, closingCents: 140000, clearedTxIds: ['t1', 't2'] })).data;
+}
+const copy = (d) => JSON.parse(JSON.stringify(d));
+const file = (d) => parseImportText(exportDatasetJson(d));
+const blockingText = (d) => file(d).findings.filter((f) => f.blocking).map((f) => f.message).join(' | ');
+
+describe('R3: reconciliation snapshots', () => {
+  it('the review reproduction ([null] snapshot) is rejected with the record and index named; nothing is imported', () => {
+    const d = copy(reconciled());
+    d.reconciliations = [{ id: 'bad-snapshot', accountId: 'checking', startDate: '2026-09-01', endDate: '2026-09-30', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] }];
+    const r = file(d);
+    expect(r.ok).toBe(false);
+    expect(r.dataset).toBeUndefined();
+    expect(r.findings.find((f) => f.code === 'recon-snapshot')).toMatchObject({ blocking: true, message: 'Reconciliation "bad-snapshot", snapshot #1 must be an object (found null).' });
+  });
+  it.each([
+    ['a number', (r) => { r.snapshots[0] = 5; }, /snapshot #1 must be an object \(found number\)/],
+    ['a string', (r) => { r.snapshots[1] = 'x'; }, /snapshot #2 must be an object/],
+    ['a list', (r) => { r.snapshots[0] = []; }, /snapshot #1 must be an object \(found a list\)/],
+    ['snapshots not a list', (r) => { r.snapshots = { 0: {} }; }, /snapshots must be a list/],
+    ['a missing txId', (r) => { delete r.snapshots[0].txId; }, /txId must be a transaction id/],
+    ['a blank txId', (r) => { r.snapshots[0].txId = ' '; }, /txId must be a transaction id/],
+    ['a numeric txId', (r) => { r.snapshots[0].txId = 7; }, /txId must be a transaction id/],
+    ['fractional cents', (r) => { r.snapshots[0].amountCents = 12.5; }, /non-zero whole number of cents \(found 12.5\)/],
+    ['an unsafe integer', (r) => { r.snapshots[0].amountCents = Number.MAX_SAFE_INTEGER + 2; }, /whole number of cents/],
+    ['a string amount', (r) => { r.snapshots[0].amountCents = '1200.00'; }, /whole number of cents/],
+    ['a zero amount', (r) => { r.snapshots[0].amountCents = 0; }, /non-zero whole number/],
+    ['a missing amount', (r) => { delete r.snapshots[0].amountCents; }, /found nothing/],
+    ['an impossible date', (r) => { r.snapshots[0].date = '2026-02-30'; }, /"2026-02-30" is not a valid calendar date/],
+    ['a missing date', (r) => { delete r.snapshots[0].date; }, /date is missing/],
+    ['a pending status', (r) => { r.snapshots[0].status = 'pending'; }, /status must be "posted"/],
+    ['another account', (r) => { r.snapshots[0].accountId = 'other'; }, /is not the reconciliation's account/],
+    ['a duplicate snapshot', (r) => { r.snapshots[1].txId = 't1'; }, /already has a snapshot/],
+    ['a cleared id without a snapshot', (r) => { r.snapshots.pop(); }, /"t2" has no snapshot/],
+    ['a snapshot that is not cleared', (r) => { r.clearedTxIds.pop(); }, /snapshot of "t2", which is not in its cleared list/],
+    ['wrong arithmetic', (r) => { r.snapshots[0].amountCents += 100; }, /does not equal closing/],
+    ['a calculated close that disagrees', (r) => { r.calculatedCents += 1; }, /calculated close/],
+    ['a draft carrying snapshots', (r) => { r.status = 'in_progress'; }, /is a draft but carries 2 snapshot/],
+    ['a null among valid snapshots', (r) => { r.snapshots.push(null); }, /snapshot #3 must be an object/],
+  ])('rejects %s', (_label, corrupt, re) => {
+    const d = copy(reconciled());
+    corrupt(d.reconciliations[0]);
+    expect(file(d).ok).toBe(false);
+    expect(blockingText(d)).toMatch(re);
+  });
+  it('a valid but STALE statement is history, not corruption: edits, moves and deletions after completion are accepted and flagged', () => {
+    const base = reconciled();
+    const cases = [
+      [(d) => updateTransaction(d, 't2', { amountCents: -31000 }), ['amount']],
+      [(d) => updateTransaction(d, 't2', { date: '2026-02-02' }), ['date']],
+      [(d) => updateTransaction(d, 't2', { accountId: 'other' }), ['account']],
+      [(d) => deleteTransactions(d, ['t1']), ['deleted']],
+    ];
+    for (const [op, problems] of cases) {
+      const r = must(op(base));
+      expect(r.warnings.join(' ')).toMatch(/out of date/);
+      expect(validateStructure(r.data).filter((f) => f.blocking)).toEqual([]);
+      expect(reconciliationHealth(r.data, r.data.reconciliations[0]).problems.map((p) => p.type)).toEqual(problems);
+      const rt = file(r.data);
+      expect(rt.ok).toBe(true);
+      expect(reconciliationHealth(rt.dataset, rt.dataset.reconciliations[0]).valid).toBe(false);
+    }
+  });
+  it('an unknown cleared id WITHOUT a snapshot is still an error: a bad reference, not history', () => {
+    const d = copy(reconciled());
+    d.reconciliations[0].clearedTxIds.push('tx-never');
+    expect(blockingText(d)).toMatch(/refers to unknown transaction "tx-never"|"tx-never" has no snapshot/);
+  });
+  it('consumers that meet malformed data anyway report it instead of throwing', () => {
+    const d = copy(reconciled());
+    const rec = d.reconciliations[0];
+    rec.snapshots = [null, 5, { txId: 't1' }, ...rec.snapshots];
+    expect(reconciliationHealth(d, rec).problems.filter((p) => p.type === 'malformed')).toHaveLength(2);
+    expect(safeSnapshots(rec)).toHaveLength(2);
+    expect(reconciledTxIds(d).size).toBe(0);
+    rec.snapshots = 'oops';
+    expect(reconciliationHealth(d, rec)).toMatchObject({ valid: false, problems: [{ type: 'malformed' }] });
+    expect(safeSnapshots(rec)).toEqual([]);
+  });
+});
+
+describe('R3 class: no field accepts a value of the wrong kind (systematic type fuzz over every record type)', () => {
+  // Every scalar field is set to an object, a list, and (for text fields) a number; every such file must be rejected.
+  it('rejects every wrong-kind value in every scalar field of every collection, nested record, meta and settings', () => {
+    const base = buildDemoDataset();
+    const targets = [];
+    const add = (path) => {
+      let o = base;
+      for (const k of path) o = o?.[k];
+      if (!o || typeof o !== 'object') return;
+      for (const [k, v] of Object.entries(o)) if (v === null || typeof v !== 'object') targets.push([...path, k]);
+    };
+    const first = (c, pred = () => true) => base[c].findIndex(pred);
+    for (const c of COLLECTIONS) add([c, 0]);
+    add(['transactions', first('transactions', (t) => t.splits.length), 'splits', 0]);
+    add(['transactions', 0, 'source']);
+    add(['transactions', first('transactions', (t) => t.recurrence), 'recurrence']);
+    add(['reconciliations', first('reconciliations', (r) => r.snapshots.length), 'snapshots', 0]);
+    add(['budgets', first('budgets', (b) => b.overrides.length), 'overrides', 0]);
+    add(['goals', first('goals', (g) => g.contributions.length), 'contributions', 0]);
+    add(['goals', 0, 'allocation']);
+    add(['accounts', first('accounts', (a) => a.loan), 'loan']);
+    add(['scenarios', 0, 'changes', 0]);
+    add(['scenarios', 0, 'assumptions']);
+    add(['meta']);
+    add(['settings']);
+    expect(targets.length).toBeGreaterThan(150);
+    const accepted = [];
+    for (const path of targets) {
+      let original = base;
+      for (const k of path) original = original[k];
+      const bad = [{}, [], ...(typeof original === 'string' ? [42] : []), ...(typeof original === 'number' ? ['12'] : []), ...(typeof original === 'boolean' ? ['yes'] : [])];
+      for (const v of bad) {
+        const d = copy(base);
+        let o = d;
+        for (const k of path.slice(0, -1)) o = o[k];
+        o[path.at(-1)] = v;
+        if (file(d).ok) accepted.push(`${path.join('.')} = ${JSON.stringify(v)}`);
+      }
+    }
+    expect(accepted).toEqual([]);
+  }, 60000);
+  it('the specific fields that used to crash pages or undo are named in the error', () => {
+    const cases = [
+      [(d) => { d.meta.name = { x: 1 }; }, /meta.name must be text/],
+      [(d) => { d.importBatches[0].importedAt = 42; }, /importedAt must be text/],
+      [(d) => { d.importBatches[0].settled = 42; }, /settled must be a list/],
+      [(d) => { d.importBatches[0].rowCount = null; }, /rowCount is required/],
+      [(d) => { d.reconciliations.find((r) => r.status === 'completed').completedAt = 42; }, /completedAt must be text/],
+      [(d) => { d.transactions.find((t) => t.splits.length).splits[0].note = { a: 1 }; }, /split #1 note must be text/],
+      [(d) => { d.transactions[0].source.rawDescription = { a: 1 }; }, /source.rawDescription must be text/],
+      [(d) => { d.scenarios[0].changes[0].label = { a: 1 }; }, /change #1: label must be text/],
+      [(d) => { d.scenarios[0].assumptions.includeSavingsInterest = 'yes'; }, /includeSavingsInterest must be true or false/],
+      [(d) => { d.goals.find((g) => g.contributions.length).contributions[0].note = 7; }, /contribution note must be text/],
+    ];
+    for (const [corrupt, re] of cases) {
+      const d = copy(buildDemoDataset());
+      corrupt(d);
+      expect(blockingText(d)).toMatch(re);
+    }
+  });
+  it('legitimate optional values are still accepted (null notes, missing timestamps, an empty scenario)', () => {
+    const d = copy(buildDemoDataset());
+    d.importBatches[0].importedAt = null;
+    d.reconciliations[0].createdAt = null;
+    d.transactions[0].source.importedAt = 'not-a-date-but-text';
+    d.scenarios.push({ id: 'scn-empty', name: 'Empty', description: '', horizonMonths: 12, asOfDate: null, assumptions: { ...DEFAULT_ASSUMPTIONS }, changes: [] });
+    expect(file(d).ok).toBe(true);
+  });
+});
+
+describe('R3: invalid saved storage is quarantined, never crashed on or silently reset', () => {
+  it('boot enters recovery with the raw text intact; starting over keeps a verbatim backup', () => {
+    const d = copy(reconciled());
+    d.reconciliations[0].snapshots = [null];
+    const raw = JSON.stringify({ format: STATE_FORMAT, version: 1, savedAt: 'x', workspace: 'main', data: d });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    const store = createStore({ storage: createStorage(backend), now: () => '2026-10-01T12:00:00.000Z' });
+    expect(store.getState().status).toBe('recovery');
+    expect(store.getState().recovery.findings.some((f) => f.code === 'recon-snapshot')).toBe(true);
+    expect(backend.getItem(KEYS.workspace('main'))).toBe(raw);
+    const out = store.resolveRecovery('demo');
+    expect(backend.getItem(out.backupKey)).toBe(raw);
+  });
+});
+
+describe('R1 legacy data: mixed-status transfers are repaired only by an explicit choice', () => {
+  function legacy() {
+    const b = new DatasetBuilder({ name: 'legacy', asOfDate: '2026-01-31' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+    b.transfer({ id: 'x1', legIds: ['a', 'b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status: 'pending', desc: 'Card payment' });
+    const d = copy(b.build());
+    d.transactions[0].status = 'posted'; // what the old one-leg "Mark posted" produced
+    return d;
+  }
+  it('lists the transfer with both legs; nothing changes without a choice; either choice validates and balances', () => {
+    const d = normalizeDataset(legacy());
+    expect(blocking(d).map((f) => f.code)).toEqual(['transfer-status-mismatch']);
+    const repairs = listTransferStatusRepairs(d);
+    expect(repairs).toEqual([{ transferId: 'x1', legs: [{ id: 'a', accountName: 'Checking', description: 'Card payment', date: '2026-01-10', amountCents: -5000, status: 'posted' }, { id: 'b', accountName: 'Card', description: 'Card payment', date: '2026-01-10', amountCents: 5000, status: 'pending' }] }]);
+    expect(applyTransferStatusRepairs(d, {}).applied).toEqual([]);
+    expect(applyTransferStatusRepairs(d, { x1: 'maybe' }).applied).toEqual([]);
+    for (const status of ['posted', 'pending']) {
+      const r = applyTransferStatusRepairs(d, { x1: status });
+      expect(r.applied).toEqual([{ transferId: 'x1', status }]);
+      expect(blocking(r.data)).toEqual([]);
+      expect(r.data.transactions.map((t) => t.status)).toEqual([status, status]);
+      expect(nw(r.data, '2026-01-31', false)).toBe(100000);
+    }
+    expect(d.transactions[0].status).toBe('posted');
+  });
+  it('saved data with the mismatch opens Recovery; a repair loads, survives reload, and keeps the original as a backup', () => {
+    const raw = JSON.stringify({ format: STATE_FORMAT, version: 1, savedAt: 'x', workspace: 'main', data: legacy() });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    const store = createStore({ storage: createStorage(backend), now: () => '2026-10-01T12:00:00.000Z' });
+    expect(store.getState().status).toBe('recovery');
+    const { data } = applyTransferStatusRepairs(store.getState().recovery.candidate, { x1: 'pending' });
+    const out = store.resolveRecovery('repair', data, 'Repaired 1 transfer.');
+    expect(backend.getItem(out.backupKey)).toBe(raw);
+    expect(store.getState().notices.join(' ')).toMatch(/Repaired 1 transfer\. The data as it was before the repair is kept as a backup/);
+    const reload = createStore({ storage: createStorage(backend) });
+    expect(reload.getState().status).toBe('ready');
+    expect(reload.data().transactions.map((t) => t.status)).toEqual(['pending', 'pending']);
+  });
+});
+
+describe('X1: draft reconciliations follow the ledger instead of blocking edits', () => {
+  it('deleting, un-posting or moving a cleared draft item removes it from the draft and recomputes its discrepancy', () => {
+    const d = buildDemoDataset();
+    const draft = d.reconciliations.find((r) => r.status === 'in_progress');
+    const [id, id2] = draft.clearedTxIds;
+    const amount = d.transactions.find((t) => t.id === id).amountCents;
+    const del = must(deleteTransactions(d, [id]));
+    const after = del.data.reconciliations.find((r) => r.id === draft.id);
+    expect(after.clearedTxIds).toEqual(draft.clearedTxIds.slice(1));
+    expect([after.calculatedCents, after.discrepancyCents]).toEqual([draft.calculatedCents - amount, draft.discrepancyCents + amount]);
+    expect(del.warnings.join(' ')).toMatch(/draft reconciliation no longer lists/);
+    const unpost = must(updateTransaction(d, id2, { status: 'pending' }));
+    expect(unpost.data.reconciliations.find((r) => r.id === draft.id).clearedTxIds).not.toContain(id2);
+    // completed reconciliations are history and are never rewritten
+    const completed = d.reconciliations.filter((r) => r.status === 'completed');
+    expect(del.data.reconciliations.filter((r) => r.status === 'completed')).toEqual(completed);
   });
 });

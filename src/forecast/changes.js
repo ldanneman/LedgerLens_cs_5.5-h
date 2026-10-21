@@ -19,6 +19,26 @@ export const CHANGE_TYPES = {
 
 export const CHANGE_TYPE_IDS = Object.keys(CHANGE_TYPES);
 
+const COMMON_FIELDS = [
+  ['label', { t: 'str', max: 120 }],
+  ['title', { t: 'str', max: 120 }],
+  ['effectiveDate', { t: 'date' }],
+  ['endDate', { t: 'date' }],
+  ['date', { t: 'date' }],
+  ['mode', { t: 'str', max: 20 }],
+  ['kind', { t: 'str', max: 20 }],
+  ['interval', { t: 'str', max: 20 }],
+  ['amountCents', { t: 'cents' }],
+  ['percentBps', { t: 'int', min: -10000, max: 100000 }],
+  ['day', { t: 'int', min: 1, max: 31 }],
+  ['accountId', { t: 'id' }],
+  ['fromAccountId', { t: 'id' }],
+  ['toAccountId', { t: 'id' }],
+  ['recurringId', { t: 'id' }],
+  ['categoryId', { t: 'id' }],
+];
+const FIELD_LABELS = { effectiveDate: 'Effective date', endDate: 'End date', date: 'Date', amountCents: 'Amount', percentBps: 'Percent change', day: 'Day of month' };
+
 /**
  * Validate one change; returns an array of messages (empty when valid).
  * @param {object} c change @param {{accounts:Map,recurring:Map}} refs
@@ -36,6 +56,13 @@ export function validateChange(c, refs) {
     errs.push(`Change type "${String(c.type)}" is not supported.`);
     return errs;
   }
+  // Every field must have its documented type even when this change type does not use it: labels are rendered
+  // and ids/dates are compared, so an object or number in an unused slot is malformed data, not "unused".
+  for (const [field, spec] of COMMON_FIELDS) {
+    const m = checkField(c[field], spec, FIELD_LABELS[field] || field);
+    if (m) errs.push(m);
+  }
+  if (c.enabled !== undefined && typeof c.enabled !== 'boolean') errs.push('Enabled must be true or false.');
   const acct = (field, label) => {
     if (c[field] && !refs.accounts.has(c[field])) errs.push(`${label} "${c[field]}" does not exist.`);
   };

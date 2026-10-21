@@ -4,8 +4,7 @@
  */
 import { buildIndex, accountContribution, isLiabilityType } from './ledger.js';
 import { upcomingOccurrences } from './recurring.js';
-import { regularPayment, dueDayOf, nextDueDate } from './debt.js';
-import { monthlyInterest } from './money.js';
+import { debtPeriod, dueDayOf, nextDueDate } from './debt.js';
 import { addDays } from './dates.js';
 import { CASH_TYPES } from './schema.js';
 import { primaryAccount } from '../forecast/engine.js';
@@ -21,13 +20,12 @@ export function upcomingDebtPayments(data, from, days = 90) {
     let date = nextDueDate(from, dueDayOf(a));
     let guard = 0;
     while (owed > 0 && date <= end && guard < 24) {
-      const interest = monthlyInterest(owed, a.aprBps);
-      const pay = Math.min(regularPayment(a, owed), owed + interest);
+      const { interestCents: interest, paymentCents: pay, endOwedCents } = debtPeriod(a, owed); // the shared payment rule
       if (pay > 0) {
         const payer = (a.autopayAccountId && index.accountsById.get(a.autopayAccountId)) || primaryAccount(data);
         rows.push({ kind: 'debt', date, scheduled: date, label: `${a.name} payment`, effectCents: -pay, accountId: a.id, payerId: payer?.id || null, cashEffectCents: payer && CASH_TYPES.includes(payer.type) ? -pay : 0, status: date === from ? 'due_today' : 'upcoming', debt: a, interestCents: interest });
       }
-      owed = owed + interest - pay;
+      owed = endOwedCents;
       date = nextDueDate(date, dueDayOf(a));
       guard += 1;
     }
