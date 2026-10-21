@@ -613,9 +613,13 @@ export function collectIds(list) {
  * Allocate the next ID for a collection inside an Immer draft (or plain object).
  * IDs look like "tx-000123"; the dataset-wide counter guarantees determinism and
  * the existence check guarantees uniqueness even for imported datasets.
+ * Bulk callers (CSV import) pass a `taken` Set built ONCE from the collection; allocated ids are added to it, so
+ * allocating n ids is O(n) instead of rescanning the whole collection (through Immer proxies) for every id.
+ * @param {object} data @param {string} prefix @param {string} collection
+ * @param {Set<string>} [taken] ids already in use (default: scanned from the collection)
  */
-export function allocId(data, prefix, collection) {
-  const ids = collectIds(data[collection]);
+export function allocId(data, prefix, collection, taken = null) {
+  const ids = taken || collectIds(data[collection]);
   let n = data.meta.seq;
   let id;
   do {
@@ -623,6 +627,7 @@ export function allocId(data, prefix, collection) {
     n += 1;
   } while (ids.has(id));
   data.meta.seq = n;
+  if (taken) taken.add(id);
   return id;
 }
 

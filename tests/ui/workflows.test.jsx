@@ -192,7 +192,6 @@ describe('reconciliation workflow', () => {
 
 describe('budgets workflow', () => {
   it('shows the rollover chain (Case E) and recalculates after editing January spending', async () => {
-    const user = userEvent.setup();
     const { store } = withMain(caseE(), '/budgets/cat-groceries?month=2026-03');
     const table = await screen.findByRole('table', { name: 'Groceries by month' });
     const row = (m) => within(table).getAllByRole('row').find((r) => within(r).queryByText(m));
@@ -203,7 +202,9 @@ describe('budgets workflow', () => {
       store.apply((d) => updateTransaction(d, 'e1', { amountCents: -10000 }));
     });
     await waitFor(() => expect(row('March 2026')).toHaveTextContent('$220.00'));
-    expect(user).toBeTruthy();
+    // January spending fell from $150 to $100: $100 rolls into February (available $200 + $100 = $300); $280 spent
+    // leaves $20, which carries into March: $200 + $20 = $220
+    expect(row('February 2026')).toHaveTextContent('$300.00');
   });
 
   it('creating a budget from the month view validates and saves', async () => {
@@ -394,5 +395,237 @@ describe('keyboard and accessibility behaviour', () => {
     renderApp('/transactions');
     const amounts = screen.getAllByRole('row').slice(1, 6).map((r) => r.textContent);
     expect(amounts.every((t) => /[+-]\$[\d,]+\.\d\d/.test(t))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Review remediation (R1-R8): public controls -> commit -> reload -> exact records and totals
+// ---------------------------------------------------------------------------------------------
+import { DatasetBuilder, usd } from '../../src/seed/builder.js';
+import { runProjection } from '../../src/forecast/engine.js';
+
+/** Open `route` over a backend that already holds `dataset`, as a returning user would. */
+function reopen(backend, route) {
+  return renderApp(route, makeStore(backend));
+}
+function seeded(dataset) {
+  const backend = createMemoryBackend();
+  const first = makeStore(backend);
+  first.store.replaceWorkspace('main', dataset, 'test');
+  return backend;
+}
+const posted = (d, date = d.settings.asOfDate) => netWorthAt(buildIndex(d), date, false).netWorth;
+
+describe('R1 in the UI: marking ONE leg of a pending transfer posted moves both and survives reload', () => {
+  const pendingPayment = () => {
+    const b = new DatasetBuilder({ name: 'R1 UI', asOfDate: '2026-01-31' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+    b.transfer({ id: 'xr1', legIds: ['r1a', 'r1b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status: 'pending', desc: 'Card payment' });
+    return b.build();
+  };
+  it('selects only the outgoing leg, clicks Mark posted, then reloads: both legs posted, posted net worth still $1,000.00', async () => {
+    const user = userEvent.setup();
+    const backend = seeded(pendingPayment());
+    const first = reopen(backend, '/transactions');
+    expect(posted(first.store.data())).toBe(100000);
+    await user.click(screen.getByLabelText('Select row r1a'));
+    await user.click(screen.getByRole('button', { name: 'Mark posted' }));
+    expect(await screen.findByText(/other side/i)).toBeInTheDocument();
+    const d = first.store.data();
+    expect(d.transactions.map((t) => [t.id, t.status])).toEqual([['r1a', 'posted'], ['r1b', 'posted']]);
+    expect(posted(d)).toBe(100000);
+    first.unmount();
+    const second = reopen(backend, '/transactions');
+    expect(second.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+    expect(posted(second.store.data())).toBe(100000);
+    // and back again from the OTHER leg
+    await user.click(screen.getByLabelText('Select row r1b'));
+    await user.click(screen.getByRole('button', { name: 'Mark pending' }));
+    await waitFor(() => expect(second.store.data().transactions.map((t) => t.status)).toEqual(['pending', 'pending']));
+    expect(posted(second.store.data())).toBe(100000);
+  });
+  it('selecting both legs changes each transfer exactly once', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(pendingPayment(), '/transactions');
+    await user.click(screen.getByLabelText('Select row r1a'));
+    await user.click(screen.getByLabelText('Select row r1b'));
+    await user.click(screen.getByRole('button', { name: 'Mark posted' }));
+    await waitFor(() => expect(store.data().transactions.every((t) => t.status === 'posted')).toBe(true));
+    expect(screen.queryByText(/other side/i)).toBeNull();
+    expect(posted(store.data())).toBe(100000);
+  });
+});
+
+describe('R1 recovery in the UI: a mixed-status pair from an older version is repaired only by explicit choice', () => {
+  it('shows the transfer, waits for a choice, repairs, keeps a backup, and loads the repaired data after reload', async () => {
+    const user = userEvent.setup();
+    const b = new DatasetBuilder({ name: 'legacy', asOfDate: '2026-01-31' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+    b.transfer({ id: 'x1', legIds: ['a', 'b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status: 'pending', desc: 'Card payment' });
+    const data = JSON.parse(JSON.stringify(b.build()));
+    data.transactions[0].status = 'posted';
+    const raw = JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: 'x', workspace: 'main', data });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    const first = reopen(backend, '/');
+    expect(await screen.findByRole('heading', { name: /could not read your saved data/i })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /Repair transfers with mismatched status/ })).toBeInTheDocument();
+    const apply = screen.getByRole('button', { name: /Apply repairs/ });
+    expect(apply).toBeDisabled(); // no silent default
+    expect(backend.getItem(KEYS.workspace('main'))).toBe(raw);
+    await user.selectOptions(screen.getByLabelText(/Both sides of transfer x1 should be/), 'posted');
+    await user.click(apply);
+    expect(await screen.findByRole('heading', { name: 'Dashboard', level: 1 })).toBeInTheDocument();
+    expect(first.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+    expect(first.store.storage.listCorruptBackups().map((k) => backend.getItem(k))).toContain(raw);
+    first.unmount();
+    const second = reopen(backend, '/transactions');
+    expect(second.store.data().transactions.map((t) => t.status)).toEqual(['posted', 'posted']);
+  });
+});
+
+describe('R2 / R5 in the UI: import identity and exact split settlement, through save and reload', () => {
+  const pendingCoffee = (ext) => {
+    const b = new DatasetBuilder({ name: 'R2 UI', asOfDate: '2026-09-30' });
+    b.category('cat-coffee', 'Coffee', 'expense');
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-09-01' });
+    b.tx({ id: 'p1', account: 'chk', date: '2026-09-15', desc: 'Review Coffee', merchant: 'Review Coffee', amount: -475, kind: 'expense', status: 'pending', source: { type: 'import', batchId: null, externalId: ext, importedAt: null, rawDescription: null } });
+    return b.build();
+  };
+  const paste = (text) => fireEvent.change(screen.getByLabelText('...or paste CSV text'), { target: { value: text } });
+
+  it('a different reference defaults to "New", commits as a second purchase, and a reimport adds nothing', async () => {
+    const user = userEvent.setup();
+    const backend = seeded(pendingCoffee('P1'));
+    const first = reopen(backend, '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount,Reference\n2026-09-16,Review Coffee,-4.75,P2\n');
+    expect(await screen.findByText('1 to import')).toBeInTheDocument();
+    expect(screen.getByText('0 settle pending')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    expect(await screen.findByText(/Import committed/)).toBeInTheDocument();
+    first.unmount();
+    const second = reopen(backend, '/import');
+    const txs = second.store.data().transactions;
+    expect(txs.map((t) => [t.status, t.amountCents, t.source.externalId])).toEqual([['pending', -475, 'P1'], ['posted', -475, 'P2']]);
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount,Reference\n2026-09-16,Review Coffee,-4.75,P2\n');
+    expect(await screen.findByText('1 already imported')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Commit import/ })).toBeDisabled();
+    expect(second.store.data().transactions).toHaveLength(2);
+  });
+
+  it('with no references, the similarity match is labelled for review, and "Import as new" keeps the pending item', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(pendingCoffee(null), '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount\n2026-09-16,Review Coffee,-4.75\n');
+    expect(await screen.findByText('1 settle pending')).toBeInTheDocument();
+    expect(screen.getByText('similarity')).toBeInTheDocument();
+    expect(screen.getByText('1 to review')).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText('Action for line 2'), 'import');
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    await waitFor(() => expect(store.data().transactions).toHaveLength(2));
+    expect(store.data().transactions.find((t) => t.id === 'p1').status).toBe('pending');
+  });
+
+  it('a changed amount shows the rescaled splits in the preview; commit, reload and undo keep them exact', async () => {
+    const user = userEvent.setup();
+    const b = new DatasetBuilder({ name: 'R5 UI', asOfDate: '2026-09-30' });
+    b.category('cat-groceries', 'Groceries', 'expense');
+    b.category('cat-household', 'Household', 'expense');
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-09-01' });
+    b.tx({ id: 'sp', account: 'chk', date: '2026-09-15', desc: 'Fresh Fields', merchant: 'Fresh Fields', amount: -1000, kind: 'expense', status: 'pending', splits: [['cat-groceries', -600], ['cat-household', -400]] });
+    const original = JSON.stringify(b.build().transactions);
+    const backend = seeded(b.build());
+    const first = reopen(backend, '/import');
+    await user.selectOptions(screen.getByLabelText('Destination account'), 'chk');
+    paste('Date,Description,Amount\n2026-09-16,Fresh Fields,-11.00\n');
+    const plan = await screen.findByTestId('split-plan-2');
+    expect(plan).toHaveTextContent(/Groceries -\$6\.60/);
+    expect(plan).toHaveTextContent(/Household -\$4\.40/);
+    await user.click(screen.getByRole('button', { name: /Commit import/ }));
+    expect(await screen.findByText(/Import committed/)).toBeInTheDocument();
+    first.unmount();
+    const second = reopen(backend, '/transactions');
+    const tx = second.store.data().transactions[0];
+    expect([tx.status, tx.amountCents, tx.splits.map((s) => s.amountCents)]).toEqual(['posted', -1100, [-660, -440]]);
+    expect(posted(second.store.data())).toBe(100000 - 1100);
+    const { undoImportBatch } = await import('../../src/domain/ops/importing.js');
+    const undone = second.store.apply((d) => undoImportBatch(d, d.importBatches[0].id), { label: 'undo' });
+    expect(undone.ok).toBe(true);
+    expect(JSON.stringify(second.store.data().transactions)).toBe(original);
+  });
+});
+
+describe('R3 / R4 through the real JSON upload flow', () => {
+  const uploadJson = async (user, dataset) => {
+    const file = new File([exportDatasetJson(dataset)], 'tampered.json', { type: 'application/json' });
+    await user.upload(screen.getByLabelText('Choose a LedgerLens export file'), file);
+  };
+  it('a null reconciliation snapshot is refused with a precise message; My finances is untouched and Reconcile still works', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(caseD(), '/settings');
+    const before = JSON.stringify(store.dataOf('main'));
+    const bad = JSON.parse(JSON.stringify(caseD()));
+    bad.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-09-01', endDate: '2026-09-30', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] });
+    await uploadJson(user, bad);
+    expect(await screen.findByText(/Not importable/)).toBeInTheDocument();
+    expect(screen.getByText(/snapshot #1 must be an object/)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Replace My finances with this file' })).toBeNull();
+    expect(JSON.stringify(store.dataOf('main'))).toBe(before);
+  });
+  it('a batch that claims a manual transaction is refused and the manual record survives', async () => {
+    const user = userEvent.setup();
+    const { store } = withMain(caseD(), '/settings');
+    const before = JSON.stringify(store.dataOf('main'));
+    const bad = JSON.parse(JSON.stringify(caseD()));
+    bad.importBatches.push({ id: 'batch-1', accountId: 'chk', status: 'committed', createdTxIds: ['d1'], settled: [] });
+    await uploadJson(user, bad);
+    expect(await screen.findByText(/Not importable/)).toBeInTheDocument();
+    expect(screen.getByText(/Undoing the batch would delete an unrelated record/)).toBeInTheDocument();
+    expect(JSON.stringify(store.dataOf('main'))).toBe(before);
+    expect(store.dataOf('main').transactions.some((t) => t.id === 'd1')).toBe(true);
+  });
+  it('a malformed snapshot in SAVED storage opens Recovery, keeps the raw text, and never crashes the reconcile page', async () => {
+    const bad = JSON.parse(JSON.stringify(caseD()));
+    bad.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-09-01', endDate: '2026-09-30', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] });
+    const raw = JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: 'x', workspace: 'main', data: bad });
+    const backend = createMemoryBackend();
+    backend.setItem(KEYS.workspace('main'), raw);
+    reopen(backend, '/import/reconcile?acct=chk');
+    expect(await screen.findByRole('heading', { name: /could not read your saved data/i })).toBeInTheDocument();
+    expect(screen.queryByText(/Cannot read properties of null/)).toBeNull();
+    expect(backend.getItem(KEYS.workspace('main'))).toBe(raw);
+  });
+});
+
+describe('R8 in the UI: the Debt page and the Planner tell the same story', () => {
+  it('shows the minimum policy, its recalculated payments ($40.00 then $39.20) and the separate fixed-payment what-if', async () => {
+    const b = new DatasetBuilder({ name: 'R8 UI', asOfDate: '2026-10-01' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('50000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: -usd('1000.00'), openingDate: '2026-01-01', aprBps: 2400, paymentMode: 'minimum', minPaymentBps: 200, minPaymentFloor: usd('25.00'), dueDay: 15, autopay: 'chk' });
+    const dataset = b.build();
+    withMain(dataset, '/goals/debt');
+    expect(await screen.findByTestId('payment-assumption')).toHaveTextContent(/Minimum payment, recalculated every month.*\$25\.00.*2%/);
+    const table = screen.getByRole('table', { name: /Payment schedule for Card/ });
+    const rows = within(table).getAllByRole('row');
+    expect(within(rows[1]).getAllByRole('cell').map((c) => c.textContent)).toEqual(expect.arrayContaining(['$40.00']));
+    expect(within(rows[2]).getAllByRole('cell').map((c) => c.textContent)).toEqual(expect.arrayContaining(['$39.20']));
+    expect(screen.getByTestId('fixed-whatif')).toHaveTextContent(/What-if, not your plan/);
+    // the forecast agrees with what the page just displayed
+    const p = runProjection(dataset, null, { horizonMonths: 12 });
+    expect(p.events.filter((e) => e.kind === 'debt_payment').slice(0, 2).map((e) => e.legs[1].cents)).toEqual([4000, 3920]);
+  });
+});
+
+describe('stale links do not crash pages', () => {
+  it('Reconcile with an unknown or foreign account falls back to the first active account', async () => {
+    withMain(caseD(), '/import/reconcile?acct=ghost&rec=also-ghost');
+    expect(await screen.findByRole('heading', { name: 'Reconcile a statement' })).toBeInTheDocument();
+    expect(screen.getByLabelText('Account')).toHaveValue('chk');
+    expect(screen.queryByText(/This page hit a problem/)).toBeNull();
   });
 });

@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useAppState, useStore, useToasts } from '../../state/hooks.jsx';
-import { exportDatasetJson, exportFileName, parseImportText, diffCounts, MAX_IMPORT_CHARS } from '../../persistence/serialize.js';
+import { exportDatasetJson, exportFileName, parseImportText, previewDataset, diffCounts, MAX_IMPORT_CHARS } from '../../persistence/serialize.js';
+import RepairPanel from '../components/RepairPanel.jsx';
 import { KEYS, STORAGE_PREFIX } from '../../persistence/storage.js';
 import { updateSettings, renameDataset } from '../../domain/ops/catalog.js';
 import { buildDemoDataset } from '../../seed/demo.js';
@@ -126,11 +127,14 @@ export default function Settings() {
           {preview && (
             <div style={{ marginTop: 12 }} aria-live="polite">
               {!preview.ok ? (
+                <>
                 <Callout tone="error">
                   <strong>Not importable.</strong> {preview.error}
                   {preview.findings?.length > 0 && <ul>{preview.findings.filter((f) => f.blocking).slice(0, 8).map((f, i) => <li key={i}>{f.message}</li>)}</ul>}
                   <p className="small">Your current data was not touched.</p>
                 </Callout>
+                <RepairPanel candidate={preview.candidate} onRepaired={(dataset, summary) => setPreview(previewDataset(dataset, [...(preview.notes || []), summary], preview.versionInfo))} />
+                </>
               ) : (
                 <>
                   <Callout tone="success"><strong>Valid.</strong> "{preview.dataset.meta.name}", as of {formatDate(preview.dataset.settings.asOfDate)}, net worth {formatMoney(preview.summary.netWorthCents ?? 0)}. {preview.notes.join(' ')}</Callout>

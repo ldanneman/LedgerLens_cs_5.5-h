@@ -74,6 +74,23 @@ export function allocateCents(total, weights) {
 }
 
 /** Sum an array of integer cents. */
+/**
+ * Re-allocate category splits to a new total, proportionally to their current sizes (largest remainder, ties to
+ * the earlier split), so the pieces add up to `newTotalCents` EXACTLY. Categories, notes and order are kept; every
+ * piece takes the sign of the new total. A piece whose share rounds to zero is dropped (a zero split is invalid)
+ * and reported in `dropped`.
+ * @param {Array<{categoryId:string, amountCents:number, note?:string}>} splits
+ * @param {number} newTotalCents non-zero
+ * @returns {{splits:Array, dropped:Array}}
+ */
+export function rescaleSplits(splits, newTotalCents) {
+  const shares = allocateCents(newTotalCents, splits.map((s) => Math.abs(s.amountCents)));
+  const kept = [];
+  const dropped = [];
+  splits.forEach((s, i) => (shares[i] === 0 ? dropped : kept).push({ ...s, amountCents: shares[i] }));
+  return { splits: kept, dropped };
+}
+
 export function sumCents(list) {
   let t = 0;
   for (const v of list) t += v;

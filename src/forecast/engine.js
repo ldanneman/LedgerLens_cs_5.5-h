@@ -6,29 +6,34 @@
  * regardless of which pages were visited before (no Date.now, no randomness, no module state).
  *
  * Start state   : each account's pending-inclusive contribution at the as-of date. Future-dated ledger
- *                 entries (date > as-of) become events instead.
+ *                 entries (date > as-of) become events instead, and so do accounts that OPEN after the as-of
+ *                 date (their opening balance is replayed once, on the opening date, as an 'opening' event that
+ *                 is neither income nor spending).
  * Window        : the `horizonMonths` calendar months beginning with the month of (as-of + 1 day).
  * Events        : (1) active recurring occurrences not already matched/skipped,
  *                 (2) future-dated ledger transactions, (3) estimated everyday spending,
  *                 (4) scenario changes, (5) debt interest + payments on each due date,
  *                 (6) month-end savings interest and assumed investment growth.
- * Order of ops on one date (lower runs first): income 10, ledger 15, expense/one-time 20,
+ * Order of ops on one date (lower runs first): account opening 5, income 10, ledger 15, expense/one-time 20,
  *                 transfers & savings 30, debt due (interest then payment) 40, lump sums 45,
  *                 month-end interest/growth 60. Ties break on a stable key.
  * Interest      : monthly = round(balance * APR / 12) on the balance at the due date, charged first
- *                 and then the payment is applied; the payment never exceeds what is owed.
+ *                 and then the payment is applied; the payment never exceeds what is owed. The per-period rule
+ *                 is debtPeriod() in domain/debt.js, shared with the debt overview schedule.
+ * Not-yet-open  : generated events (recurring, scenario, estimate) dated before an account opens are not applied
+ *                 to a balance that does not exist yet; a note says how many were skipped.
  * Growth        : balance * annual% / 12 each month-end (a planning assumption, never a guarantee).
  * Cash may go negative (overdraft): the projection flags it instead of blocking or hiding it.
  */
 import { buildIndex, accountContribution, isLiabilityType } from '../domain/ledger.js';
 import { occurrencesBetween, linkedOccurrences } from '../domain/recurring.js';
-import { regularPayment, dueDayOf } from '../domain/debt.js';
+import { debtPeriod, dueDayOf } from '../domain/debt.js';
 import { allocateGoals } from '../domain/goals.js';
 import { monthlyInterest, mulDiv, roundDiv } from '../domain/money.js';
 import { addDays, addMonths, addMonthKey, monthKey, monthEnd, monthStart, monthsBetween, daysInMonth, parseDate, makeDate } from '../domain/dates.js';
 import { CASH_TYPES } from '../domain/schema.js';
 
-const ORDER = { income: 10, ledger: 15, expense: 20, transfer: 30, debt: 40, lump: 45, monthEnd: 60 };
+const ORDER = { opening: 5, income: 10, ledger: 15, expense: 20, transfer: 30, debt: 40, lump: 45, monthEnd: 60 };
 const INTEREST_NAME = /interest/i;
 
 export const DEFAULT_ASSUMPTIONS = Object.freeze({ investmentGrowthBps: null, variableSpending: 'trailing', variableSpendingCents: null, includeSavingsInterest: true });
@@ -103,7 +108,28 @@ export function runProjection(data, scenario = null, opts = {}) {
 
   const events = [];
   let seq = 0;
-  const push = (e) => events.push({ ...e, key: `${e.date}|${String(e.order).padStart(3, '0')}|${String(seq++).padStart(6, '0')}` });
+  const skippedBeforeOpen = new Map(); // account id -> count of generated events dated before it opens
+  const opensAfter = (accountId, date) => {
+    const a = index.accountsById.get(accountId);
+    return Boolean(a) && date < a.openingDate;
+  };
+  const push = (e) => {
+    // Ledger entries are canonical records and always apply; GENERATED events cannot act on an account that has
+    // not opened yet (that would create a phantom overdraft that the opening balance later "repairs").
+    const blocked = e.type === 'ledger' || !e.legs ? null : e.legs.find((l) => opensAfter(l.accountId, e.date));
+    if (blocked) {
+      skippedBeforeOpen.set(blocked.accountId, (skippedBeforeOpen.get(blocked.accountId) || 0) + 1);
+      return;
+    }
+    events.push({ ...e, key: `${e.date}|${String(e.order).padStart(3, '0')}|${String(seq++).padStart(6, '0')}` });
+  };
+
+  // ---- accounts that open inside the window: replay the opening balance once, on its date
+  for (const a of data.accounts) {
+    if (a.openingDate > asOfDate && a.openingDate <= endDate && a.openingCents !== 0) {
+      push({ date: a.openingDate, order: ORDER.opening, type: 'opening', kind: 'opening', label: `${a.name} opens`, legs: [{ accountId: a.id, cents: a.openingCents }], changeId: null });
+    }
+  }
 
   // ---- recurring rules (+ scenario modifications)
   const links = linkedOccurrences(data);
@@ -174,12 +200,17 @@ export function runProjection(data, scenario = null, opts = {}) {
       push({ date: c.date, order: c.amountCents > 0 ? ORDER.income : ORDER.expense, type: 'scenario', kind: c.amountCents > 0 ? 'windfall' : 'expense', label: c.title, legs: [{ accountId: c.accountId, cents: c.amountCents }], changeId: c.id });
     }
     if (c.type === 'savings_change') {
+      // Occurrences fall on `day` (default: the effective date's day) of every month from the effective month on;
+      // clamped to short months. Jump straight to the first month that can hold a date after the as-of date, then
+      // walk to the end of the window - an old effective date costs nothing and no occurrence is lost.
       const e = parseDate(c.effectiveDate);
       const day = c.day || e.d;
-      for (let k = 0; k < horizonMonths + 2; k += 1) {
-        const date = addMonths(makeDate(e.y, e.m, 1), k, day);
-        if (date < c.effectiveDate || date <= asOfDate) continue;
+      const anchor = makeDate(e.y, e.m, 1);
+      const k0 = Math.max(0, monthsBetween(monthKey(c.effectiveDate), monthKey(asOfDate)));
+      for (let k = k0; ; k += 1) {
+        const date = addMonths(anchor, k, day);
         if (date > endDate) break;
+        if (date < c.effectiveDate || date <= asOfDate) continue;
         push({ date, order: ORDER.transfer, type: 'scenario', kind: 'transfer', label: c.title || 'Savings change', legs: [{ accountId: c.fromAccountId, cents: -c.amountCents }, { accountId: c.toAccountId, cents: c.amountCents }], changeId: c.id });
       }
     }
@@ -214,19 +245,24 @@ export function runProjection(data, scenario = null, opts = {}) {
   if (growthBps !== 0) notes.push(`Investment accounts are assumed to change by ${(growthBps / 100).toFixed(2)}% per year (applied monthly). This is a planning assumption, not a prediction or guarantee.`);
   else notes.push('Investment accounts are held flat (0% assumed growth) unless a growth rate is set; contributions are modeled, market returns are not.');
 
+  for (const [id, n] of skippedBeforeOpen) {
+    const a = index.accountsById.get(id);
+    notes.push(`${n} scheduled event${n === 1 ? '' : 's'} dated before ${a.name} opens (${a.openingDate}) ${n === 1 ? 'was' : 'were'} not applied, because the account does not exist yet.`);
+  }
   events.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
 
   // ---- debt policy helpers
-  const payerFor = (a) => {
+  const payerFor = (a, date) => {
     const p = a.autopayAccountId && index.accountsById.get(a.autopayAccountId);
-    return p && p.status === 'active' ? p.id : primary?.id || null;
+    const id = p && p.status === 'active' ? p.id : primary?.id || null;
+    return id && !opensAfter(id, date) ? id : null; // a payer that has not opened yet cannot fund a payment
   };
   const debtStats = new Map(debtAccounts.map((a) => [a.id, { accountId: a.id, name: a.name, startOwedCents: Math.max(0, -startBal.get(a.id)), interestCents: 0, paidCents: 0, payoffDate: null, belowInterest: false, firstPaymentCents: null }]));
 
   // ---- replay
   const log = [];
   const monthly = [];
-  const acc = new Map(months.map((m) => [m, { incomeCents: 0, expensesCents: 0, interestPaidCents: 0, interestEarnedCents: 0, growthCents: 0, externalCents: 0, adjustmentCents: 0, debtPaymentsCents: 0, savingsMovedCents: 0, nwChangeCents: 0 }]));
+  const acc = new Map(months.map((m) => [m, { incomeCents: 0, expensesCents: 0, interestPaidCents: 0, interestEarnedCents: 0, growthCents: 0, openingCents: 0, externalCents: 0, adjustmentCents: 0, debtPaymentsCents: 0, savingsMovedCents: 0, nwChangeCents: 0 }]));
   const apply = (e, legs) => {
     let nw = 0;
     for (const l of legs) {
@@ -243,6 +279,7 @@ export function runProjection(data, scenario = null, opts = {}) {
       else if (e.kind === 'interest_paid') a.interestPaidCents += -net;
       else if (e.kind === 'interest_earned') a.interestEarnedCents += net;
       else if (e.kind === 'growth') a.growthCents += net;
+      else if (e.kind === 'opening') a.openingCents += net;
       else if (e.kind === 'adjustment') a.adjustmentCents += net;
       else if (e.kind === 'debt_payment') a.debtPaymentsCents += legs[1]?.cents ?? 0;
       else if (e.kind === 'transfer') a.savingsMovedCents += legs.filter((l) => l.cents > 0 && CASH_TYPES.includes(index.accountsById.get(l.accountId)?.type)).reduce((s, l) => s + l.cents, 0);
@@ -279,20 +316,19 @@ export function runProjection(data, scenario = null, opts = {}) {
         const st = debtStats.get(a.id);
         const owed = -(bal.get(a.id) || 0);
         if (owed <= 0) continue;
-        const interest = monthlyInterest(owed, a.aprBps);
+        let setPay = null;
+        let extra = 0;
+        for (const c of changes) {
+          if (c.type !== 'debt_payment' || c.accountId !== a.id || !activeAt(c, e.date)) continue;
+          if (c.mode === 'set') setPay = c.amountCents;
+          else extra += c.amountCents;
+        }
+        const { interestCents: interest, paymentCents: total } = debtPeriod(a, owed, { setPaymentCents: setPay, extraCents: extra });
         if (interest > 0) {
           apply({ ...e, kind: 'interest_paid', label: `${a.name} interest` }, [{ accountId: a.id, cents: -interest }]);
           st.interestCents += interest;
         }
-        let pay = regularPayment(a, owed);
-        let extra = 0;
-        for (const c of changes) {
-          if (c.type !== 'debt_payment' || c.accountId !== a.id || !activeAt(c, e.date)) continue;
-          if (c.mode === 'set') pay = Math.min(c.amountCents, owed + interest);
-          else extra += c.amountCents;
-        }
-        const total = Math.min(pay + extra, owed + interest);
-        const payer = payerFor(a);
+        const payer = payerFor(a, e.date);
         const cid = changes.find((c) => c.type === 'debt_payment' && c.accountId === a.id && activeAt(c, e.date))?.id || null;
         if (total > 0 && payer) {
           apply({ ...e, kind: 'debt_payment', label: `Payment to ${a.name}`, changeId: cid }, [{ accountId: payer, cents: -total }, { accountId: a.id, cents: total }]);
@@ -311,7 +347,7 @@ export function runProjection(data, scenario = null, opts = {}) {
       if (e.type === 'lump') {
         const a = index.accountsById.get(e.accountId);
         const owed = -(bal.get(a.id) || 0);
-        const payer = payerFor(a);
+        const payer = payerFor(a, e.date);
         const amt = Math.min(e.amountCents, Math.max(0, owed));
         if (amt > 0 && payer) {
           apply({ ...e, label: e.label }, [{ accountId: payer, cents: -amt }, { accountId: a.id, cents: amt }]);
@@ -381,6 +417,7 @@ export function runProjection(data, scenario = null, opts = {}) {
     interestPaidCents: sum('interestPaidCents'),
     interestEarnedCents: sum('interestEarnedCents'),
     growthCents: sum('growthCents'),
+    openingCents: sum('openingCents'),
     netCashFlowCents: sum('netCashFlowCents'),
     debtPaymentsCents: sum('debtPaymentsCents'),
     startNetWorthCents: startNw,

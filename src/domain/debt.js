@@ -2,6 +2,8 @@
  * Debt maths: payment policy, amortization schedules and payoff comparisons.
  *
  * Assumptions (documented in the README):
+ *  - Payment policy: fixed amount, minimum (max(floor, interest + x% of balance), recalculated each period) or
+ *    pay in full. debtPeriod() applies it for one period and is shared with the forecast engine.
  *  - Interest accrues monthly: interest = round(balance * APR / 12) (half away from zero), computed
  *    on the balance at each payment/due date. This is a planning model, NOT a lender payoff quote.
  *  - Each period: balance += interest; payment = min(payment, balance); balance -= payment.
@@ -70,10 +72,35 @@ export function nextDueDate(date, dueDay) {
 }
 
 /**
- * Amortization-style schedule.
- * @param {{balanceCents:number, aprBps:number, paymentCents:number, extraCents?:number,
+ * ONE period of debt service: the single rule shared by the forecast engine and the policy-based schedule, so
+ * the two can never disagree.
+ *   interest = round(owed * APR / 12), added first;
+ *   payment  = the account's regular payment for this period (or `setPaymentCents` when a scenario replaces
+ *              it), plus `extraCents`, never more than owed + interest (the final payment cannot overshoot).
+ * @param {object} acct account (aprBps, paymentMode, scheduledPaymentCents, minPaymentBps, minPaymentFloorCents)
+ * @param {number} owedCents amount owed at the start of the period (>= 0; <= 0 means nothing is owed)
+ * @param {{setPaymentCents?:number|null, extraCents?:number}} [opt]
+ * @returns {{interestCents:number, paymentCents:number, principalCents:number, endOwedCents:number}}
+ */
+export function debtPeriod(acct, owedCents, { setPaymentCents = null, extraCents = 0 } = {}) {
+  if (!(owedCents > 0)) return { interestCents: 0, paymentCents: 0, principalCents: 0, endOwedCents: 0 };
+  const interestCents = monthlyInterest(owedCents, acct.aprBps);
+  const cap = owedCents + interestCents;
+  const base = setPaymentCents !== null && setPaymentCents !== undefined ? Math.min(setPaymentCents, cap) : regularPayment(acct, owedCents);
+  const paymentCents = Math.min(base + extraCents, cap);
+  return { interestCents, paymentCents, principalCents: paymentCents - interestCents, endOwedCents: cap - paymentCents };
+}
+
+/**
+ * Amortization-style schedule. Two explicit modes (reported back as `assumption`):
+ *  - 'account_policy' (pass `account`): every period re-applies the account's own payment policy through
+ *     debtPeriod, exactly like the forecast does. `setPaymentCents` replaces the regular payment (a what-if),
+ *     `extraCents` is added on top.
+ *  - 'fixed_payment' (pass `paymentCents`): one constant payment (+ extra) every period, e.g. a what-if
+ *     that holds this month's minimum fixed.
+ * @param {{balanceCents:number, aprBps:number, account?:object, paymentCents?:number, setPaymentCents?:number|null, extraCents?:number,
  *          firstPaymentDate:string, lumpSums?:Array<{period:number, amountCents:number}>, maxPeriods?:number}} p
- * @returns {{rows:Array, status:string, payoffDate:string|null, periods:number, totalInterestCents:number, totalPaidCents:number, message:string}}
+ * @returns {{rows:Array, status:string, payoffDate:string|null, periods:number, totalInterestCents:number, totalPaidCents:number, message:string, assumption:string, paymentMode:string}}
  */
 export function amortizationSchedule(p) {
   const maxPeriods = p.maxPeriods ?? 600;
@@ -81,61 +108,58 @@ export function amortizationSchedule(p) {
   let bal = p.balanceCents;
   let totalInterest = 0;
   let totalPaid = 0;
-  const payment = (p.paymentCents || 0) + (p.extraCents || 0);
+  const policy = p.account ? { ...p.account, aprBps: p.aprBps ?? p.account.aprBps } : null;
+  const assumption = policy ? 'account_policy' : 'fixed_payment';
+  const paymentMode = policy ? policy.paymentMode || 'fixed' : 'fixed';
+  const extra = p.extraCents || 0;
+  const fixedPayment = (p.paymentCents || 0) + extra;
   const lumps = new Map();
   for (const l of p.lumpSums || []) lumps.set(l.period, (lumps.get(l.period) || 0) + l.amountCents);
-  let status = 'in_progress';
-  let message = '';
-  if (bal <= 0) {
-    return { rows, status: 'no_balance', payoffDate: null, periods: 0, totalInterestCents: 0, totalPaidCents: 0, message: 'Nothing is owed.' };
-  }
-  if (payment <= 0 && !lumps.size) {
-    return { rows, status: 'zero_payment', payoffDate: null, periods: 0, totalInterestCents: 0, totalPaidCents: 0, message: 'No payment is scheduled, so the balance is never reduced.' };
-  }
-  const firstInterest = monthlyInterest(bal, p.aprBps);
+  const meta = { assumption, paymentMode };
+  const empty = (status, message) => ({ rows, status, payoffDate: null, periods: 0, totalInterestCents: 0, totalPaidCents: 0, message, ...meta });
+  /** interest and (capped) payment for the period starting at `owed`; `lump` is an extra one-off for this period */
+  const step = (owed, lump) => {
+    if (policy) return debtPeriod(policy, owed, { setPaymentCents: p.setPaymentCents ?? null, extraCents: extra + lump });
+    const interestCents = monthlyInterest(owed, p.aprBps);
+    const cap = owed + interestCents;
+    const paymentCents = Math.min(fixedPayment + lump, cap);
+    return { interestCents, paymentCents, principalCents: paymentCents - interestCents, endOwedCents: cap - paymentCents };
+  };
+  if (bal <= 0) return empty('no_balance', 'Nothing is owed.');
+  const first = step(bal, 0);
+  if (first.paymentCents <= 0 && !lumps.size) return empty('zero_payment', 'No payment is scheduled, so the balance is never reduced.');
   const anchorDay = parseDate(p.firstPaymentDate).d;
+  const pushRow = (i, owed, r) => {
+    rows.push({ period: i + 1, date: addMonths(p.firstPaymentDate, i, anchorDay), startCents: owed, interestCents: r.interestCents, paymentCents: r.paymentCents, principalCents: r.principalCents, endCents: r.endOwedCents });
+    totalInterest += r.interestCents;
+    totalPaid += r.paymentCents;
+  };
   for (let i = 0; i < maxPeriods && bal > 0; i += 1) {
-    const interest = monthlyInterest(bal, p.aprBps);
-    const due = bal + interest;
-    const pay = Math.min(payment + (lumps.get(i + 1) || 0), due);
-    const principal = pay - interest;
-    const end = due - pay;
-    rows.push({
-      period: i + 1,
-      date: addMonths(p.firstPaymentDate, i, anchorDay),
-      startCents: bal,
-      interestCents: interest,
-      paymentCents: pay,
-      principalCents: principal,
-      endCents: end,
-    });
-    totalInterest += interest;
-    totalPaid += pay;
-    bal = end;
-    if (i === 0 && payment <= firstInterest && p.aprBps > 0 && !lumps.size) {
-      // payment does not even cover interest: show a few periods then stop, honestly.
-      status = 'payment_below_interest';
-      message = `The payment (${payment} cents) does not cover the monthly interest (${firstInterest} cents), so the balance grows and is never paid off.`;
+    const r = step(bal, lumps.get(i + 1) || 0);
+    pushRow(i, bal, r);
+    bal = r.endOwedCents;
+    if (i === 0 && r.paymentCents <= r.interestCents && p.aprBps > 0 && !lumps.size) {
+      // the payment does not even cover the interest: show a few periods, then stop honestly
+      const message = `The payment (${r.paymentCents} cents) does not cover the monthly interest (${r.interestCents} cents), so the balance grows and is never paid off.`;
       for (let j = 1; j < Math.min(maxPeriods, 12) && bal > 0; j += 1) {
-        const itr = monthlyInterest(bal, p.aprBps);
-        const due2 = bal + itr;
-        const pay2 = Math.min(payment, due2);
-        rows.push({ period: j + 1, date: addMonths(p.firstPaymentDate, j, anchorDay), startCents: bal, interestCents: itr, paymentCents: pay2, principalCents: pay2 - itr, endCents: due2 - pay2 });
-        totalInterest += itr;
-        totalPaid += pay2;
-        bal = due2 - pay2;
+        const q = step(bal, 0);
+        pushRow(j, bal, q);
+        bal = q.endOwedCents;
       }
-      return { rows, status, payoffDate: null, periods: rows.length, totalInterestCents: totalInterest, totalPaidCents: totalPaid, message };
+      return { rows, status: 'payment_below_interest', payoffDate: null, periods: rows.length, totalInterestCents: totalInterest, totalPaidCents: totalPaid, message, ...meta };
     }
   }
-  if (bal === 0) {
-    status = 'paid_off';
-    message = `Paid off after ${rows.length} payment${rows.length === 1 ? '' : 's'}.`;
-  } else {
-    status = 'not_paid_off_in_horizon';
-    message = `Not paid off within ${maxPeriods} payments.`;
-  }
-  return { rows, status, payoffDate: status === 'paid_off' ? rows[rows.length - 1].date : null, periods: rows.length, totalInterestCents: totalInterest, totalPaidCents: totalPaid, message };
+  const paidOff = bal === 0;
+  return {
+    rows,
+    status: paidOff ? 'paid_off' : 'not_paid_off_in_horizon',
+    payoffDate: paidOff ? rows[rows.length - 1].date : null,
+    periods: rows.length,
+    totalInterestCents: totalInterest,
+    totalPaidCents: totalPaid,
+    message: paidOff ? `Paid off after ${rows.length} payment${rows.length === 1 ? '' : 's'}.` : `Not paid off within ${maxPeriods} payments.`,
+    ...meta,
+  };
 }
 
 /**
@@ -162,7 +186,11 @@ export function debtOverview(data, date, includePending = true) {
     const owed = -accountContribution(index, a.id, date, includePending);
     const regular = regularPayment(a, Math.max(0, owed));
     const first = nextDueDate(date, dueDayOf(a));
-    const schedule = amortizationSchedule({ balanceCents: Math.max(0, owed), aprBps: a.aprBps, paymentCents: regular, firstPaymentDate: first, maxPeriods: 600 });
+    // `schedule` follows the account's payment policy every period (same rule as the forecast). For a minimum-payment
+    // account `fixedSchedule` is the separate what-if "keep paying this month's amount": for other modes they coincide.
+    const base = { balanceCents: Math.max(0, owed), aprBps: a.aprBps, firstPaymentDate: first, maxPeriods: 600 };
+    const schedule = amortizationSchedule({ ...base, account: a });
+    const fixedSchedule = a.paymentMode === 'minimum' ? amortizationSchedule({ ...base, paymentCents: regular }) : schedule;
     rows.push({
       account: a,
       owedCents: owed,
@@ -171,6 +199,7 @@ export function debtOverview(data, date, includePending = true) {
       nextDueDate: first,
       monthlyInterestCents: monthlyInterest(Math.max(0, owed), a.aprBps),
       schedule,
+      fixedSchedule,
       limitCents: a.creditLimitCents || null,
       utilizationPct: a.creditLimitCents && owed > 0 ? Math.round((owed / a.creditLimitCents) * 1000) / 10 : a.creditLimitCents ? 0 : null,
     });

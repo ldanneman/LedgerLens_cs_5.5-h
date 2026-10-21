@@ -11,7 +11,17 @@
  *     No transaction is ever dropped silently: suspected rows default to Skip but can be kept.
  *  3. A PENDING ledger item can be settled by a posted row: same reference, or (heuristic) same
  *     account/sign, date within 5 days, amount within max($3, 25%) and similar description.
+ *     The heuristic NEVER bridges two different references: if both the row and the pending item carry a
+ *     reference and they differ, they are different purchases. A missing reference on either side is fine
+ *     (a bank adds one when an item posts). Heuristic matches are labelled `basis: 'heuristic'`, are flagged
+ *     `ambiguous` when several pending items qualify (the best is proposed, the rest are `alternatives`), and
+ *     always stay reviewable: Import-as-new or Skip is one click away. Equal amount/date/merchant is evidence,
+ *     not proof.
+ *  4. When a settlement changes the amount of a pending item that has category splits, the preview carries a
+ *     `splitPlan`: the splits rescaled proportionally to the new amount (see rescaleSplits), so the commit can
+ *     keep the splits exact instead of failing later.
  */
+import { rescaleSplits } from '../domain/money.js';
 
 /** Lowercase alphanumeric tokens of a description. */
 export function tokens(s) {
@@ -29,6 +39,30 @@ export function similarity(a, b) {
 }
 
 const norm = (s) => tokens(s).join(' ');
+const refOf = (t) => (typeof t?.source?.externalId === 'string' ? t.source.externalId : '');
+
+/** True when both references are present and differ: two distinct bank records, never one purchase. */
+export function refsConflict(a, b) {
+  return Boolean(a) && Boolean(b) && a !== b;
+}
+
+/**
+ * The split re-allocation proposed when a pending item (with splits) is settled at `newAmountCents`; undefined when
+ * there is nothing to re-allocate (no splits, or an unchanged amount).
+ * @returns {{policy:'proportional', before:Array, after:Array, dropped:Array, reason:string}|undefined}
+ */
+export function settlementSplitPlan(pending, newAmountCents) {
+  if (!pending?.splits?.length || pending.amountCents === newAmountCents) return undefined;
+  const { splits, dropped } = rescaleSplits(pending.splits, newAmountCents);
+  const before = pending.splits.map((x) => ({ categoryId: x.categoryId, amountCents: x.amountCents }));
+  return {
+    policy: 'proportional',
+    before,
+    after: splits.map((x) => ({ categoryId: x.categoryId, amountCents: x.amountCents })),
+    dropped: dropped.map((x) => ({ categoryId: x.categoryId, amountCents: x.amountCents })),
+    reason: 'The amount changed, so the category splits are rescaled in proportion (leftover cents go to the largest remainders) and still add up exactly.',
+  };
+}
 const dayDiff = (a, b) => Math.abs((Date.parse(`${a}T00:00:00Z`) - Date.parse(`${b}T00:00:00Z`)) / 86400000);
 
 /**
@@ -54,6 +88,11 @@ export function matchRows(data, accountId, rows) {
   const used = new Map(); // fingerprint -> how many file rows already consumed
   const pendingList = existing.filter((t) => t.status === 'pending' && t.kind !== 'transfer');
 
+  const withPlan = (match, pending, row) => {
+    const plan = settlementSplitPlan(pending, row.amountCents);
+    return plan ? { ...match, splitPlan: plan, reason: `${match.reason} ${plan.reason}` } : match;
+  };
+
   return rows.map((row) => {
     if (!row.ok) return { ...row, match: { type: 'rejected', reason: row.errors.join(' '), action: 'skip' } };
     if (row.externalId) {
@@ -65,24 +104,28 @@ export function matchRows(data, accountId, rows) {
       if (hit) {
         if (hit.status === 'pending' && row.status === 'posted' && !claimedPending.has(hit.id)) {
           claimedPending.add(hit.id);
-          return { ...row, match: { type: 'settles_pending', existingTxId: hit.id, reason: `Same reference as pending "${hit.description}"; it will be marked posted.`, action: 'settle' } };
+          return { ...row, match: withPlan({ type: 'settles_pending', basis: 'reference', ambiguous: false, alternatives: [], existingTxId: hit.id, reason: `Same reference as pending "${hit.description}"; it will be marked posted.`, action: 'settle' }, hit, row) };
         }
         return { ...row, match: { type: 'duplicate', existingTxId: hit.id, reason: `Reference ${row.externalId} was already imported ("${hit.description}", ${hit.date}).`, action: 'skip' } };
       }
     }
-    // pending settlement by heuristic
+    // pending settlement by heuristic (never across two different references)
     if (row.status === 'posted') {
       const tol = (base) => Math.max(300, Math.round(Math.abs(base) * 0.25));
-      const cand = pendingList
+      const cands = pendingList
         .filter((t) => !claimedPending.has(t.id))
+        .filter((t) => !refsConflict(refOf(t), row.externalId))
         .filter((t) => Math.sign(t.amountCents) === Math.sign(row.amountCents))
         .filter((t) => dayDiff(t.date, row.date) <= 5 && Math.abs(t.amountCents - row.amountCents) <= tol(t.amountCents))
-        .map((t) => ({ t, sim: similarity(t.description, row.description) }))
+        .map((t, order) => ({ t, order, sim: similarity(t.description, row.description), gap: Math.abs(t.amountCents - row.amountCents), days: dayDiff(t.date, row.date) }))
         .filter((c) => c.sim >= 0.5)
-        .sort((a, b) => b.sim - a.sim)[0];
-      if (cand) {
+        .sort((a, b) => b.sim - a.sim || a.gap - b.gap || a.days - b.days || a.order - b.order);
+      if (cands.length) {
+        const cand = cands[0];
+        const alternatives = cands.slice(1, 6).map((c) => c.t.id);
         claimedPending.add(cand.t.id);
-        return { ...row, match: { type: 'settles_pending', existingTxId: cand.t.id, reason: `Looks like the posted version of pending "${cand.t.description}" (${cand.t.date}, ${cand.t.amountCents} cents); it will be updated instead of duplicated.`, action: 'settle' } };
+        const also = alternatives.length ? ` ${alternatives.length} other pending item${alternatives.length === 1 ? '' : 's'} also look similar; check this is the right one.` : '';
+        return { ...row, match: withPlan({ type: 'settles_pending', basis: 'heuristic', ambiguous: alternatives.length > 0, alternatives, existingTxId: cand.t.id, reason: `Looks like the posted version of pending "${cand.t.description}" (${cand.t.date}, ${cand.t.amountCents} cents); it will be updated instead of duplicated.${also} Choose Import as new if it is a separate purchase.`, action: 'settle' }, cand.t, row) };
       }
     }
     // count-based matching against existing entries that cannot be told apart by reference
@@ -109,7 +152,7 @@ export function summarizePlan(rows) {
     else s.skipped += 1;
     if (type === 'duplicate' || type === 'in_file_duplicate') s.duplicates += 1;
     if (type === 'suspected') s.suspected += 1;
-    if (r.ok && r.warnings.length) s.attention += 1;
+    if ((r.ok && r.warnings.length) || (type === 'settles_pending' && r.match.basis === 'heuristic' && action === 'settle') || r.match.ambiguous) s.attention += 1;
   }
   return s;
 }

@@ -201,7 +201,7 @@ function Debt() {
   const interestMonthly = rows.reduce((s, r) => s + r.monthlyInterestCents, 0);
   return (
     <>
-      <PageHead title="Debt & payoff">Cards and loans, with projected payoff under the scheduled payment and a what-if calculator for extra payments.</PageHead>
+      <PageHead title="Debt & payoff">Cards and loans, with projected payoff under each account's payment policy (the same rule the Scenario Planner uses) and a what-if calculator for extra payments.</PageHead>
       <Callout tone="warn"><strong>Projections only.</strong> Payoff dates use a simple monthly model (interest = balance × APR ÷ 12 each due date, rounded to the cent). They are planning estimates, not lender payoff quotes; real interest depends on daily balances, fees and payment timing.</Callout>
       <div className="grid cols-3" style={{ margin: '16px 0' }}>
         <Card><Stat label="Total owed" value={<Money cents={totalOwed} tone="none" />} sub="Cards and loans, including pending" /></Card>
@@ -220,7 +220,7 @@ function Debt() {
                   { key: 'n', header: 'Debt', main: true, render: (r) => <button type="button" className="btn ghost small title" style={{ padding: 0, minHeight: 0, fontWeight: 650 }} onClick={() => setSel(r.account.id)} aria-pressed={r.account.id === row?.account.id}>{r.account.name}</button> },
                   { key: 'o', header: 'Owed', className: 'num', render: (r) => <Owed contributionCents={-r.owedCents} /> },
                   { key: 'a', header: 'APR', className: 'num', render: (r) => formatBps(r.aprBps) },
-                  { key: 'p', header: 'Regular payment', className: 'num', render: (r) => (r.account.paymentMode === 'pay_in_full' ? 'Pay in full' : formatMoney(r.regularPaymentCents)) },
+                  { key: 'p', header: 'Regular payment', className: 'num', render: (r) => (r.account.paymentMode === 'pay_in_full' ? 'Pay in full' : r.account.paymentMode === 'minimum' ? <>{formatMoney(r.regularPaymentCents)}<div className="tiny muted">minimum, changes monthly</div></> : formatMoney(r.regularPaymentCents)) },
                   { key: 'i', header: 'Interest / month', className: 'num', render: (r) => formatMoney(r.monthlyInterestCents) },
                   { key: 'd', header: 'Next due', render: (r) => formatDate(r.nextDueDate) },
                   { key: 'u', header: 'Used', className: 'num', render: (r) => (r.utilizationPct === null ? '-' : `${r.utilizationPct}%`) },
@@ -234,6 +234,13 @@ function Debt() {
       )}
     </>
   );
+}
+
+/** One-sentence description of how an account's regular payment is decided each month. */
+function policyText(a) {
+  if (a.paymentMode === 'pay_in_full') return 'Pay in full: the whole balance (plus that month\'s interest) is paid every month.';
+  if (a.paymentMode === 'minimum') return `Minimum payment, recalculated every month: the larger of ${formatMoney(a.minPaymentFloorCents || 0)} and that month's interest + ${(a.minPaymentBps || 0) / 100}% of the balance (never more than is owed).`;
+  return `Fixed payment of ${formatMoney(a.scheduledPaymentCents || 0)} every month (the last payment is capped at what is owed).`;
 }
 
 function Calculator({ row, asOf }) {
@@ -252,8 +259,10 @@ function Calculator({ row, asOf }) {
   const basePayment = regularPayment(a, owed);
   const valid = ex.ok && lu.ok && ov.ok && apr.ok;
   const first = nextDueDate(asOf, dueDayOf(a));
-  const baseline = useMemo(() => amortizationSchedule({ balanceCents: owed, aprBps: a.aprBps, paymentCents: basePayment, firstPaymentDate: first, maxPeriods: 600 }), [owed, a.aprBps, basePayment, first]);
-  const scenario = useMemo(() => (valid ? amortizationSchedule({ balanceCents: owed, aprBps: apr.bps, paymentCents: ov.cents ?? basePayment, extraCents: ex.cents, lumpSums: lu.cents ? [{ period: Math.max(1, Number(lumpPeriod) || 1), amountCents: lu.cents }] : [], firstPaymentDate: first, maxPeriods: 600 }) : null), [valid, owed, apr, ov, basePayment, ex, lu, lumpPeriod, first]);
+  // The plan follows the account's own payment policy every month - the same rule the Scenario Planner forecast uses.
+  const baseline = useMemo(() => amortizationSchedule({ balanceCents: owed, aprBps: a.aprBps, account: a, firstPaymentDate: first, maxPeriods: 600 }), [owed, a, first]);
+  // A typed regular payment is an explicit fixed-payment what-if; without one the policy keeps applying (plus extras).
+  const scenario = useMemo(() => (valid ? amortizationSchedule({ balanceCents: owed, aprBps: apr.bps, account: a, setPaymentCents: ov.cents, extraCents: ex.cents, lumpSums: lu.cents ? [{ period: Math.max(1, Number(lumpPeriod) || 1), amountCents: lu.cents }] : [], firstPaymentDate: first, maxPeriods: 600 }) : null), [valid, owed, a, apr, ov, ex, lu, lumpPeriod, first]);
   const cmp = scenario ? compareSchedules(baseline, scenario) : null;
   const sched = scenario || baseline;
   const rowsShown = showAll ? sched.rows : sched.rows.slice(0, 24);
@@ -265,14 +274,20 @@ function Calculator({ row, asOf }) {
         <MoneyField label="Extra payment every month" value={extra} onChange={setExtra} error={!ex.ok ? ex.error : undefined} />
         <MoneyField label="One-time extra payment" value={lump} onChange={setLump} error={!lu.ok ? lu.error : undefined} />
         <TextField label="...made with payment number" type="number" min="1" value={lumpPeriod} onChange={setLumpPeriod} />
-        <MoneyField label={`Regular payment (now ${basePayment ? formatMoney(basePayment) : '$0.00'})`} value={override} onChange={setOverride} error={!ov.ok ? ov.error : undefined} hint="Leave empty to use the scheduled payment." />
+        <MoneyField label={`Regular payment (now ${basePayment ? formatMoney(basePayment) : '$0.00'})`} value={override} onChange={setOverride} error={!ov.ok ? ov.error : undefined} hint="Leave empty to follow the account's payment policy. Typing an amount holds that fixed payment every month (a what-if)." />
         <TextField label="APR % (what-if)" value={aprText} onChange={setAprText} error={!apr.ok ? apr.error : undefined} />
       </div>
+      <p className="small" data-testid="payment-assumption"><strong>Payment assumption:</strong> {ov.cents !== null && ov.ok ? `a fixed payment of ${formatMoney(ov.cents)} every month (what-if you typed above).` : policyText(a)}</p>
       <div className="grid cols-3" style={{ margin: '14px 0' }}>
         <Stat label="Payoff date" value={sched.status === 'paid_off' ? formatDate(sched.payoffDate) : 'Not paid off'} sub={sched.message} />
         <Stat label="Total interest" value={<Money cents={sched.totalInterestCents} tone="none" />} sub={`Total paid ${formatMoney(sched.totalPaidCents)}`} />
         <Stat label="Compared with the current plan" value={cmp?.comparable && changed ? `${cmp.monthsSaved} month${cmp.monthsSaved === 1 ? '' : 's'} sooner` : changed ? 'Not comparable' : 'No change yet'} sub={cmp?.comparable && changed ? `Saves ${formatMoney(cmp.interestSavedCents)} in interest` : changed ? 'One of the plans never pays off, so savings cannot be calculated.' : 'Enter an extra payment above.'} />
       </div>
+      {a.paymentMode === 'minimum' && row.fixedSchedule && row.owedCents > 0 && (
+        <Callout tone="info" data-testid="fixed-whatif">
+          <strong>What-if, not your plan:</strong> if you kept paying this month's {formatMoney(row.regularPaymentCents)} every month instead of letting the minimum shrink, {row.fixedSchedule.status === 'paid_off' ? `the debt would be paid off ${formatDate(row.fixedSchedule.payoffDate)} (${row.fixedSchedule.periods} payments) with ${formatMoney(row.fixedSchedule.totalInterestCents)} of interest` : 'it would not be paid off within the horizon'}, versus {baseline.status === 'paid_off' ? `${formatDate(baseline.payoffDate)} (${baseline.periods} payments) with ${formatMoney(baseline.totalInterestCents)} of interest` : 'no payoff within the horizon'} when following the minimum.
+        </Callout>
+      )}
       {sched.status === 'payment_below_interest' && <Callout tone="error">The payment ({formatMoney(ov.cents ?? basePayment)}) does not cover this month's interest ({formatMoney(row.monthlyInterestCents)}). The balance grows and the debt is never paid off. Increase the payment.</Callout>}
       {sched.status === 'zero_payment' && <Callout tone="warn">No payment is scheduled for this account. Set a scheduled payment in the account details or enter one above.</Callout>}
       {sched.rows.length > 0 && (
@@ -297,7 +312,7 @@ function Calculator({ row, asOf }) {
           {sched.rows.length > 24 && <button type="button" className="btn small" style={{ marginTop: 8 }} onClick={() => setShowAll((s) => !s)}>{showAll ? 'Show first 24 only' : `Show all ${sched.rows.length} payments`}</button>}
         </>
       )}
-      <Explain summary="Assumptions"><p>Payments happen on the due day each month starting {formatDate(first)}. Each period adds one month of interest (balance × APR ÷ 12, rounded half away from zero to the cent) and then subtracts the payment; the last payment is capped so it never exceeds what is owed. New purchases on a card are not modeled here.</p></Explain>
+      <Explain summary="Assumptions"><p>{policyText(a)} Payments happen on the due day each month starting {formatDate(first)}. Each period adds one month of interest (balance × APR ÷ 12, rounded half away from zero to the cent) and then subtracts the payment; the last payment is capped so it never exceeds what is owed. New purchases on a card are not modeled here.</p></Explain>
     </Card>
   );
 }

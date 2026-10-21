@@ -58,7 +58,7 @@ export function createStore({ storage, now = () => new Date().toISOString(), per
       storage.saveWorkspace('main', workspaces.main, now());
     } else if (main.status === 'corrupt') {
       status = 'recovery';
-      recovery = { workspace: 'main', raw: main.raw, reason: main.reason, findings: main.findings };
+      recovery = { workspace: 'main', raw: main.raw, reason: main.reason, findings: main.findings, candidate: main.candidate || null };
       workspaces.main = null;
     } else {
       // storage unreadable: continue in memory with demo data and tell the user
@@ -154,13 +154,17 @@ export function createStore({ storage, now = () => new Date().toISOString(), per
       return { ok: r.ok !== false, preset: p };
     },
 
-    /** Resolve a corrupt-data recovery: keep a verbatim backup, then start from demo data or an imported dataset. */
-    resolveRecovery(action, dataset = null) {
+    /**
+     * Resolve a corrupt-data recovery: keep a verbatim backup, then continue with demo data ('demo'), an imported
+     * dataset ('import') or the user's own saved data after explicit repairs ('repair'; see repairs.js).
+     */
+    resolveRecovery(action, dataset = null, note = '') {
       const rec = state.recovery;
       if (!rec) return { ok: false, errors: [{ message: 'Nothing to recover.' }] };
       const backup = storage.backupCorrupt(rec.raw, now());
-      const next = action === 'import' && dataset ? dataset : buildDemoDataset();
-      set({ ...state, status: 'ready', recovery: null, active: 'main', workspaces: { ...state.workspaces, main: next }, history: [] });
+      const next = (action === 'import' || action === 'repair') && dataset ? dataset : buildDemoDataset();
+      const notices = action === 'repair' && note ? [...state.notices, `${note} The original data is kept as a backup (${backup.key || 'see Settings / Data'}).`] : state.notices;
+      set({ ...state, status: 'ready', recovery: null, active: 'main', workspaces: { ...state.workspaces, main: next }, history: [], notices });
       persist('main', next);
       return { ok: true, backupKey: backup.key };
     },

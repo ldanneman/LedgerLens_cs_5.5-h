@@ -159,8 +159,13 @@ export function addTransaction(data, input, ctx = {}) {
 }
 
 /**
- * Edit a transaction. Transfer legs only allow description/merchant/notes/tags here; use
- * updateTransfer for amount, date, accounts and status so both legs stay balanced.
+ * Edit a transaction.
+ *
+ * Transfer legs allow description/merchant/notes/tags on THAT leg only. A transfer's amount, date and
+ * accounts must go through updateTransfer so both legs stay balanced. `status` is a property of the whole
+ * transfer: changing it on either leg of an internal transfer moves BOTH legs in one atomic commit (a
+ * one-leg status change would silently change posted net worth). A single-leg external transfer just
+ * changes its own status.
  */
 export function updateTransaction(data, id, patch) {
   const index = buildIndex(data);
@@ -184,8 +189,14 @@ export function updateTransaction(data, id, patch) {
     const t = d.transactions.find((x) => x.id === id);
     const warnings = [];
     if (cur.kind === 'transfer') {
-      for (const k of ['description', 'merchant', 'notes', 'status']) if (patch[k] !== undefined) t[k] = patch[k];
+      for (const k of ['description', 'merchant', 'notes']) if (patch[k] !== undefined) t[k] = patch[k];
       if (patch.tags !== undefined) t.tags = cleanTags(patch.tags);
+      if (patch.status !== undefined && patch.status !== cur.status) {
+        const legs = (index.legsByTransfer.get(cur.transferId) || [cur]).map((l) => l.id);
+        for (const x of d.transactions) if (legs.includes(x.id)) x.status = patch.status;
+        warnings.push(...reconWarnings(data, legs, 'You changed'));
+        if (legs.length > 1) warnings.push(`Both sides of the transfer are now ${patch.status}; a transfer's legs always share one status so net worth stays balanced.`);
+      }
     } else {
       const touchesReconciled = ['amountCents', 'date', 'status', 'accountId'].some((k) => patch[k] !== undefined && patch[k] !== cur[k]);
       Object.assign(t, {
@@ -300,6 +311,9 @@ function structuredCloneSafe(o) {
  * Bulk edit. patch: { categoryId?: string|null, addTags?: string[], removeTags?: string[], status?: 'posted'|'pending' }.
  * Incompatible transactions (e.g. a category of the wrong kind, or splitting transfers)
  * are skipped and reported in `warnings`; all compatible ones change together.
+ * A status change is applied to a whole internal transfer: selecting one leg also changes the other side
+ * (reported in `warnings`), and selecting both legs changes each exactly once. `updatedCount` counts
+ * distinct transactions that were changed, including those counterpart legs.
  */
 export function bulkUpdateTransactions(data, ids, patch) {
   const index = buildIndex(data);
@@ -322,6 +336,22 @@ export function bulkUpdateTransactions(data, ids, patch) {
       }
     }
     targets.push(tx.id);
+  }
+  // A status change must move a whole internal transfer; pull in any leg that was not selected.
+  let pulledIn = 0;
+  if (patch.status && targets.length) {
+    const have = new Set(targets);
+    for (const id of [...targets]) {
+      const tx = index.txById.get(id);
+      if (!tx.transferId) continue;
+      for (const leg of index.legsByTransfer.get(tx.transferId) || []) {
+        if (!have.has(leg.id)) {
+          have.add(leg.id);
+          targets.push(leg.id);
+          pulledIn += 1;
+        }
+      }
+    }
   }
   if (!targets.length) return fail(skipped.length ? `Nothing was changed. Skipped: ${skipped.slice(0, 3).join('; ')}${skipped.length > 3 ? '...' : ''}` : 'No transactions selected.');
   return mutate(data, (d) => {
@@ -346,6 +376,7 @@ export function bulkUpdateTransactions(data, ids, patch) {
       }
     }
     if (reconTouched) warnings.push(...reconWarnings(data, targets, 'You changed'));
+    if (pulledIn) warnings.push(`${pulledIn} transfer leg${pulledIn === 1 ? ' on the other side was' : 's on the other side were'} also set to ${patch.status}, because both sides of a transfer share one status.`);
     if (skipped.length) warnings.push(`Skipped ${skipped.length}: ${skipped.slice(0, 3).join('; ')}${skipped.length > 3 ? '...' : ''}`);
     return { updatedCount: targets.length, warnings };
   });
@@ -532,6 +563,7 @@ export function linkAsTransfer(data, idA, idB) {
   if (a.kind === 'transfer' || b.kind === 'transfer') return fail('One of them is already part of a transfer.');
   if (a.kind === 'adjustment' || b.kind === 'adjustment') return fail('Adjustments cannot be turned into transfers.');
   if (a.accountId === b.accountId) return fail('The two entries must be in different accounts.');
+  if (a.status !== b.status) return fail(`One entry is ${a.status} and the other is ${b.status}. Both sides of a transfer share one status, so post or settle the pending one first.`);
   if (a.amountCents + b.amountCents !== 0) return fail(`The amounts must be equal and opposite (${a.amountCents} and ${b.amountCents} cents do not cancel).`);
   return mutate(data, (d) => {
     const trId = allocId(d, 'xfr', 'transfers');
@@ -551,8 +583,8 @@ export function linkAsTransfer(data, idA, idB) {
 
 /**
  * Find likely transfer pairs among unlinked entries: opposite amounts, different accounts, dates within
- * 4 days, and at least one description mentioning payment/transfer. Used after imports so card and
- * loan payments are not double counted as spending.
+ * 4 days, the same status (both sides of a transfer share one), and at least one description mentioning
+ * payment/transfer. Used after imports so card and loan payments are not double counted as spending.
  */
 export function suggestTransferPairs(data) {
   const cands = data.transactions.filter((t) => (t.kind === 'income' || t.kind === 'expense') && !t.reversalOf);
@@ -566,7 +598,7 @@ export function suggestTransferPairs(data) {
   const looks = /pay(ment)?|transfer|xfer|autopay|thank you/i;
   for (const t of cands) {
     if (t.amountCents >= 0 || used.has(t.id)) continue;
-    const partners = (byAmount.get(-t.amountCents) || []).filter((p) => !used.has(p.id) && p.accountId !== t.accountId && Math.abs((Date.parse(`${p.date}T00:00:00Z`) - Date.parse(`${t.date}T00:00:00Z`)) / 86400000) <= 4);
+    const partners = (byAmount.get(-t.amountCents) || []).filter((p) => !used.has(p.id) && p.accountId !== t.accountId && p.status === t.status && Math.abs((Date.parse(`${p.date}T00:00:00Z`) - Date.parse(`${t.date}T00:00:00Z`)) / 86400000) <= 4);
     const best = partners.filter((p) => looks.test(t.description) || looks.test(p.description))[0];
     if (best) {
       used.add(t.id);

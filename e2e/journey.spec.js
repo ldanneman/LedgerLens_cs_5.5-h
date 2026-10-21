@@ -1,4 +1,17 @@
 import { test, expect } from '@playwright/test';
+import { DatasetBuilder, usd } from '../src/seed/builder.js';
+import { exportDatasetJson } from '../src/persistence/serialize.js';
+
+const MAIN_KEY = 'ledgerlens:v1:workspace:main';
+/** Pre-load a small, controlled workspace (only when none exists yet, so later reloads keep the user's edits). */
+async function seedWorkspace(page, dataset, raw = null) {
+  const value = raw ?? JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: '2026-10-01T00:00:00.000Z', workspace: 'main', data: dataset });
+  await page.addInitScript(([k, v]) => { if (!window.localStorage.getItem(k)) window.localStorage.setItem(k, v); }, [MAIN_KEY, value]);
+}
+const stored = (page) => page.evaluate((k) => window.localStorage.getItem(k), MAIN_KEY);
+const storedData = async (page) => JSON.parse(await stored(page)).data;
+/** Posted net worth at the as-of date, recomputed from the raw stored records (independent of the app's own code). */
+const postedNetWorth = (d) => d.accounts.reduce((sum, a) => sum + (a.openingDate <= d.settings.asOfDate ? a.openingCents : 0), 0) + d.transactions.filter((t) => t.status === 'posted' && t.date <= d.settings.asOfDate).reduce((s, t) => s + t.amountCents, 0);
 
 const go = (page, hash) => page.goto(`/#/${hash}`);
 const dismissToasts = async (page) => {
@@ -20,8 +33,18 @@ test.describe('seeded demo and everyday workflows', () => {
   test('filter, open a purchase, change its category', async ({ page }) => {
     await go(page, 'transactions');
     await page.getByLabel('Search').fill('Corner Bean');
-    await expect(page.getByText(/of 946 transactions/)).toBeVisible();
-    await expect(page.getByText(/transactions · money in/)).toContainText('Corner Bean'.length ? '' : '');
+    // the filter narrows the ledger: a non-empty subset is counted, and every listed row is a match
+    const summary = page.getByText(/transactions · money in/);
+    await expect(summary).toBeVisible();
+    const counts = async () => {
+      const m = (await summary.innerText()).match(/^([\d,]+) of ([\d,]+) transactions/);
+      return { shown: Number(m[1].replace(/,/g, '')), total: Number(m[2].replace(/,/g, '')) };
+    };
+    await expect.poll(async () => (await counts()).shown).toBeLessThan((await counts()).total); // the search is applied (it is debounced)
+    expect((await counts()).shown).toBeGreaterThan(0);
+    const bodyRows = page.locator('tbody tr');
+    await expect(bodyRows.first()).toContainText('Corner Bean');
+    expect(await bodyRows.count()).toBe(await bodyRows.filter({ hasText: 'Corner Bean' }).count());
     const first = page.getByRole('button', { name: /^Edit Corner Bean Coffee$/ }).first();
     await first.click();
     const dlg = page.getByRole('dialog');
@@ -207,6 +230,114 @@ test.describe('seeded demo and everyday workflows', () => {
     await page.keyboard.press('Escape');
     await expect(page.getByRole('dialog')).toHaveCount(0);
     await expect(add).toBeFocused();
+  });
+});
+
+test.describe('review remediation: controlled ledgers, saved and reloaded', () => {
+  const small = () => {
+    const b = new DatasetBuilder({ name: 'Controlled ledger', asOfDate: '2026-01-31' });
+    b.category('cat-food', 'Food', 'expense');
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+    b.tx({ id: 'c1', account: 'chk', date: '2026-01-05', desc: 'Corner Bean Coffee', amount: -475, kind: 'expense', category: 'cat-food' });
+    b.tx({ id: 'c2', account: 'chk', date: '2026-01-06', desc: 'Corner Bean Coffee', amount: -525, kind: 'expense', category: 'cat-food' });
+    b.tx({ id: 'g1', account: 'chk', date: '2026-01-07', desc: 'Green Basket Market', amount: -5420, kind: 'expense', category: 'cat-food' });
+    b.tx({ id: 'p1', account: 'chk', date: '2026-01-08', desc: 'Payroll deposit', amount: 268412, kind: 'income' });
+    return b.build();
+  };
+  const pendingPayment = () => {
+    const b = new DatasetBuilder({ name: 'Pending card payment', asOfDate: '2026-01-31' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+    b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+    b.transfer({ id: 'xr1', legIds: ['r1a', 'r1b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status: 'pending', desc: 'Card payment' });
+    return b.build();
+  };
+
+  test('search filters a small ledger: matches shown, a known non-match absent, count and money-in/out reflect only the matches', async ({ page }) => {
+    await seedWorkspace(page, small());
+    await go(page, 'transactions');
+    await expect(page.getByText(/^4 of 4 transactions/)).toBeVisible();
+    await page.getByLabel('Search').fill('Corner Bean');
+    await expect(page.getByText(/^2 of 4 transactions/)).toBeVisible();
+    await expect(page.locator('tbody tr')).toHaveCount(2);
+    await expect(page.getByRole('row', { name: /Corner Bean Coffee/ })).toHaveCount(2);
+    await expect(page.getByRole('row', { name: /Green Basket Market/ })).toHaveCount(0);
+    await expect(page.getByRole('row', { name: /Payroll deposit/ })).toHaveCount(0);
+    await expect(page.getByText(/money out/)).toContainText('-$10.00'); // 4.75 + 5.25, nothing from the unmatched rows
+    await expect(page.getByText(/money in/)).toContainText('$0.00');
+  });
+
+  test('R1: marking ONE leg of a pending card payment posted posts both, keeps posted net worth at $1,000.00, and survives reload', async ({ page }) => {
+    await seedWorkspace(page, pendingPayment());
+    await go(page, 'transactions');
+    await page.getByLabel('Select row r1a').check();
+    await page.getByRole('button', { name: 'Mark posted' }).click();
+    await expect(page.getByText(/other side/i).first()).toBeVisible();
+    await page.reload();
+    const d = await storedData(page);
+    expect(d.transactions.map((t) => [t.id, t.status])).toEqual([['r1a', 'posted'], ['r1b', 'posted']]);
+    expect(postedNetWorth(d)).toBe(100000);
+    await go(page, '');
+    await expect(page.locator('.stat', { hasText: 'Net worth' }).first().locator('.value')).toContainText('$1,000.00');
+  });
+
+  test('R2: a posted row with a different reference stays a separate purchase through commit and reload; reimport adds nothing', async ({ page }) => {
+    const b = new DatasetBuilder({ name: 'R2', asOfDate: '2026-09-30' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-09-01' });
+    b.tx({ id: 'p1', account: 'chk', date: '2026-09-15', desc: 'Review Coffee', merchant: 'Review Coffee', amount: -475, kind: 'expense', status: 'pending', source: { type: 'import', batchId: null, externalId: 'P1', importedAt: null, rawDescription: null } });
+    await seedWorkspace(page, b.build());
+    const csv = 'Date,Description,Amount,Reference\n2026-09-16,Review Coffee,-4.75,P2\n';
+    await go(page, 'import');
+    await page.getByLabel('Destination account').selectOption({ label: 'Checking' });
+    await page.getByLabel('...or paste CSV text').fill(csv);
+    await expect(page.getByText('1 to import')).toBeVisible();
+    await expect(page.getByText('0 settle pending')).toBeVisible();
+    await page.getByRole('button', { name: /Commit import/ }).click();
+    await expect(page.getByText('Import committed.')).toBeVisible();
+    await page.reload();
+    const d = await storedData(page);
+    expect(d.transactions.map((t) => [t.status, t.amountCents, t.source.externalId])).toEqual([['pending', -475, 'P1'], ['posted', -475, 'P2']]);
+    await go(page, 'import');
+    await page.getByLabel('Destination account').selectOption({ label: 'Checking' });
+    await page.getByLabel('...or paste CSV text').fill(csv);
+    await expect(page.getByText('1 already imported')).toBeVisible();
+    await expect(page.getByRole('button', { name: /Commit import/ })).toBeDisabled();
+    expect((await storedData(page)).transactions).toHaveLength(2);
+  });
+
+  test('R3/R4: tampered JSON uploads are refused with a reason and leave the saved workspace byte-for-byte unchanged', async ({ page }) => {
+    await seedWorkspace(page, small());
+    await go(page, 'settings');
+    const before = await stored(page);
+    const badSnapshot = JSON.parse(JSON.stringify(small()));
+    badSnapshot.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-01-01', endDate: '2026-01-31', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] });
+    await page.getByLabel('Choose a LedgerLens export file').setInputFiles({ name: 'bad-snapshot.json', mimeType: 'application/json', buffer: Buffer.from(exportDatasetJson(badSnapshot)) });
+    await expect(page.getByText(/Not importable/)).toBeVisible();
+    await expect(page.getByText(/snapshot #1 must be an object/)).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Replace My finances with this file' })).toHaveCount(0);
+    const badBatch = JSON.parse(JSON.stringify(small()));
+    badBatch.importBatches.push({ id: 'batch-1', accountId: 'chk', status: 'committed', createdTxIds: ['c1'], settled: [] });
+    await page.getByLabel('Choose a LedgerLens export file').setInputFiles({ name: 'bad-batch.json', mimeType: 'application/json', buffer: Buffer.from(exportDatasetJson(badBatch)) });
+    await expect(page.getByText(/Undoing the batch would delete an unrelated record/)).toBeVisible();
+    expect(await stored(page)).toBe(before);
+    await page.reload();
+    expect(await stored(page)).toBe(before);
+  });
+
+  test('R3: saved data with a malformed snapshot opens Recovery (no crash), keeps the raw text, and offers a backup-first restart', async ({ page }) => {
+    const bad = JSON.parse(JSON.stringify(small()));
+    bad.reconciliations.push({ id: 'bad-snapshot', accountId: 'chk', startDate: '2026-01-01', endDate: '2026-01-31', openingCents: 100000, closingCents: 100000, status: 'completed', discrepancyCents: 0, clearedTxIds: [], snapshots: [null] });
+    const raw = JSON.stringify({ format: 'ledgerlens-state', version: 1, savedAt: 'x', workspace: 'main', data: bad });
+    await seedWorkspace(page, null, raw);
+    const errors = [];
+    page.on('pageerror', (e) => errors.push(e.message));
+    await go(page, 'import/reconcile?acct=chk');
+    await expect(page.getByRole('heading', { name: /could not read your saved data/i })).toBeVisible();
+    expect(await stored(page)).toBe(raw);
+    await page.getByRole('button', { name: 'Start with demo data' }).click();
+    await expect(page.getByRole('heading', { name: 'Reconcile a statement' })).toBeVisible(); // the page we asked for, now loading demo data
+    const backups = await page.evaluate(() => Object.keys(window.localStorage).filter((k) => k.includes('corrupt-backup')).map((k) => window.localStorage.getItem(k)));
+    expect(backups).toContain(raw);
+    expect(errors).toEqual([]);
   });
 });
 

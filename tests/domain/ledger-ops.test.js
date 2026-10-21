@@ -333,3 +333,143 @@ describe('categories and rules', () => {
     expect(deleteCategory(d, 'cat-groceries', { reassignTo: 'cat-salary' }).ok).toBe(false);
   });
 });
+
+// ---------------------------------------------------------------------------------------------
+// R1 - a transfer's status is a property of the TRANSFER, never of one leg.
+// ---------------------------------------------------------------------------------------------
+import { DatasetBuilder, usd } from '../../src/seed/builder.js';
+import { parseImportText, exportDatasetJson } from '../../src/persistence/serialize.js';
+import { reconciledTxIds } from '../../src/domain/reconciliation.js';
+
+/** Checking $1,000, card $0, one pending $50 card payment (legs r1a = checking -50, r1b = card +50). */
+function pendingPayment({ status = 'pending' } = {}) {
+  const b = new DatasetBuilder({ name: 'R1', asOfDate: '2026-01-31' });
+  b.category('cat-salary', 'Salary', 'income');
+  b.account('chk', { name: 'Checking', type: 'checking', opening: usd('1000.00'), openingDate: '2026-01-01' });
+  b.account('card', { name: 'Card', type: 'credit_card', opening: 0, openingDate: '2026-01-01' });
+  b.transfer({ id: 'xr1', legIds: ['r1a', 'r1b'], from: 'chk', to: 'card', amount: usd('50.00'), date: '2026-01-10', status, desc: 'Card payment' });
+  return b.build();
+}
+const postedNw = (d) => nw(d, '2026-01-31', false);
+const statusOf = (d, id) => d.transactions.find((t) => t.id === id).status;
+
+describe('R1: transfer status changes are atomic', () => {
+  it('posting ONE leg through updateTransaction posts both and keeps posted net worth at $1,000', () => {
+    const d = pendingPayment();
+    expect(postedNw(d)).toBe(100000);
+    for (const leg of ['r1a', 'r1b']) {
+      const r = must(updateTransaction(d, leg, { status: 'posted' }));
+      expect(statusOf(r.data, 'r1a')).toBe('posted');
+      expect(statusOf(r.data, 'r1b')).toBe('posted');
+      expect(bal(r.data, 'chk', '2026-01-31')).toBe(95000);
+      expect(bal(r.data, 'card', '2026-01-31')).toBe(5000);
+      expect(postedNw(r.data)).toBe(100000);
+    }
+  });
+  it('unposting from either leg moves both back to pending (posted balances return to opening)', () => {
+    const d = pendingPayment({ status: 'posted' });
+    for (const leg of ['r1a', 'r1b']) {
+      const r = must(updateTransaction(d, leg, { status: 'pending' }));
+      expect(statusOf(r.data, 'r1a')).toBe('pending');
+      expect(statusOf(r.data, 'r1b')).toBe('pending');
+      expect(bal(r.data, 'chk', '2026-01-31')).toBe(100000);
+      expect(bal(r.data, 'card', '2026-01-31')).toBe(0);
+      expect(postedNw(r.data)).toBe(100000);
+    }
+  });
+  it('a note edit on one leg stays on that leg while a status edit is paired', () => {
+    const d = pendingPayment();
+    const r = must(updateTransaction(d, 'r1a', { status: 'posted', notes: 'only here' }));
+    expect(r.data.transactions.find((t) => t.id === 'r1a').notes).toBe('only here');
+    expect(r.data.transactions.find((t) => t.id === 'r1b').notes).not.toBe('only here');
+    expect(statusOf(r.data, 'r1b')).toBe('posted');
+  });
+  it('bulk "Mark posted" on one leg expands to the whole transfer; both legs selected is processed once', () => {
+    const d = pendingPayment();
+    const one = must(bulkUpdateTransactions(d, ['r1a'], { status: 'posted' }));
+    expect(statusOf(one.data, 'r1a')).toBe('posted');
+    expect(statusOf(one.data, 'r1b')).toBe('posted');
+    expect(one.updatedCount).toBe(2);
+    expect(one.warnings.join(' ')).toMatch(/other side/i);
+    expect(postedNw(one.data)).toBe(100000);
+    const both = must(bulkUpdateTransactions(d, ['r1a', 'r1b'], { status: 'posted' }));
+    expect(both.updatedCount).toBe(2);
+    expect(both.warnings.join(' ')).not.toMatch(/other side/i);
+    expect(postedNw(both.data)).toBe(100000);
+    const back = must(bulkUpdateTransactions(one.data, ['r1b'], { status: 'pending' }));
+    expect(statusOf(back.data, 'r1a')).toBe('pending');
+    expect(postedNw(back.data)).toBe(100000);
+  });
+  it('bulk status across a mix of ordinary rows and transfer legs changes each transfer as a unit', () => {
+    const d = must(addTransaction(pendingPayment(), { accountId: 'chk', date: '2026-01-12', description: 'Pending coffee', amountCents: -450, kind: 'expense', status: 'pending' })).data;
+    const coffee = d.transactions.find((t) => t.description === 'Pending coffee').id;
+    const r = must(bulkUpdateTransactions(d, [coffee, 'r1b'], { status: 'posted' }));
+    expect(r.data.transactions.every((t) => t.status === 'posted')).toBe(true);
+    expect(postedNw(r.data)).toBe(100000 - 450);
+  });
+  it('external (single-leg) transfers can still change status on their own', () => {
+    const b = new DatasetBuilder({ name: 'ext', asOfDate: '2026-01-31' });
+    b.account('chk', { name: 'Checking', type: 'checking', opening: usd('100.00'), openingDate: '2026-01-01' });
+    b.external({ account: 'chk', amount: -usd('20.00'), date: '2026-01-05', counterparty: 'Landlord', status: 'pending' });
+    const d = b.build();
+    const leg = d.transactions[0].id;
+    const r = must(updateTransaction(d, leg, { status: 'posted' }));
+    expect(statusOf(r.data, leg)).toBe('posted');
+    expect(postedNw(r.data)).toBe(8000);
+  });
+  it('rejects an invalid status value on a leg without touching data', () => {
+    const d = pendingPayment();
+    expect(updateTransaction(d, 'r1a', { status: 'maybe' }).ok).toBe(false);
+    expect(bulkUpdateTransactions(d, ['r1a'], { status: 'maybe' }).ok).toBe(false);
+  });
+  it('the structural validator refuses a mixed-status internal pair, whatever created it', () => {
+    const d = JSON.parse(JSON.stringify(pendingPayment()));
+    d.transactions.find((t) => t.id === 'r1a').status = 'posted';
+    const f = validateStructure(d).filter((x) => x.blocking);
+    expect(f.map((x) => x.code)).toContain('transfer-status-mismatch');
+    expect(f.find((x) => x.code === 'transfer-status-mismatch').message).toMatch(/r1a|Card payment/);
+  });
+  it('a JSON file carrying a mixed-status pair is rejected by the import boundary (nothing applied)', () => {
+    const d = JSON.parse(JSON.stringify(pendingPayment()));
+    d.transactions.find((t) => t.id === 'r1b').status = 'posted';
+    const res = parseImportText(exportDatasetJson(d));
+    expect(res.ok).toBe(false);
+    expect(res.findings.some((f) => f.code === 'transfer-status-mismatch')).toBe(true);
+  });
+  it('linking two separate entries as a transfer requires matching status', () => {
+    let d = pendingPayment();
+    d = must(deleteTransactions(d, ['r1a'])).data;
+    d = must(addTransaction(d, { accountId: 'chk', date: '2026-01-10', description: 'Card payment', amountCents: -5000, kind: 'expense', status: 'posted' })).data;
+    d = must(addTransaction(d, { accountId: 'card', date: '2026-01-10', description: 'Payment thank you', amountCents: 5000, kind: 'income', status: 'pending' })).data;
+    const [a, b] = d.transactions.slice(-2).map((t) => t.id);
+    const res = linkAsTransfer(d, a, b);
+    expect(res.ok).toBe(false);
+    expect(res.errors[0].message).toMatch(/pending|posted/i);
+  });
+  it('flags the completed reconciliation that included the counterpart leg as out of date', () => {
+    const d0 = pendingPayment({ status: 'posted' });
+    const rec = must(completeReconciliation(d0, { accountId: 'chk', startDate: '2026-01-01', endDate: '2026-01-31', openingCents: 100000, closingCents: 95000, clearedTxIds: ['r1a'] }));
+    expect(reconciledTxIds(rec.data).has('r1a')).toBe(true);
+    // edit through the OTHER leg: the statement on checking must still notice
+    const r = must(updateTransaction(rec.data, 'r1b', { status: 'pending' }));
+    expect(r.warnings.join(' ')).toMatch(/reconciliation of Checking/);
+    expect(reconciliationHealth(r.data, r.data.reconciliations[0]).problems.map((p) => p.type)).toContain('status');
+    expect(reconciledTxIds(r.data).has('r1a')).toBe(false);
+    const bulk = must(bulkUpdateTransactions(rec.data, ['r1b'], { status: 'pending' }));
+    expect(bulk.warnings.join(' ')).toMatch(/reconciliation of Checking/);
+  });
+});
+
+describe('R1 follow-up: transfer pair suggestions respect the shared-status rule', () => {
+  it('does not suggest linking a pending entry with a posted one (linking would be refused)', () => {
+    let d = pendingPayment();
+    d = must(deleteTransactions(d, ['r1a'])).data;
+    d = must(addTransaction(d, { accountId: 'chk', date: '2026-01-10', description: 'Card payment', amountCents: -5000, kind: 'expense', status: 'posted' })).data;
+    d = must(addTransaction(d, { accountId: 'card', date: '2026-01-10', description: 'Payment thank you', amountCents: 5000, kind: 'income', status: 'pending' })).data;
+    expect(suggestTransferPairs(d)).toEqual([]);
+    const [a, b] = d.transactions.slice(-2).map((t) => t.id);
+    d = must(updateTransaction(d, b, { status: 'posted' })).data;
+    expect(suggestTransferPairs(d)).toHaveLength(1);
+    expect(must(linkAsTransfer(d, a, b)).data.transfers.some((t) => t.legIds.includes(a) && t.legIds.includes(b))).toBe(true);
+  });
+});

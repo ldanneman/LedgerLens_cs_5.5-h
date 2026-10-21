@@ -12,6 +12,19 @@
  */
 import { buildIndex, accountContribution } from './ledger.js';
 import { addDays } from './dates.js';
+import { isObj } from './schema.js';
+
+/** The cleared-id list of a reconciliation as an array of strings, whatever shape bad data gave it. */
+const clearedIds = (r) => (Array.isArray(r?.clearedTxIds) ? r.clearedTxIds.filter((x) => typeof x === 'string') : []);
+
+/**
+ * The well-formed snapshots of a reconciliation (objects with a transaction id and an integer amount). Display
+ * code uses this so one bad record cannot crash a page; reconciliationHealth reports the malformed ones and the
+ * structural validator rejects them at the import/commit boundary.
+ */
+export function safeSnapshots(rec) {
+  return Array.isArray(rec?.snapshots) ? rec.snapshots.filter((s) => isObj(s) && typeof s.txId === 'string' && Number.isSafeInteger(s.amountCents)) : [];
+}
 
 /** Core equation. */
 export function reconcileMath(openingCents, closingCents, clearedEffects) {
@@ -31,7 +44,7 @@ export function reconciliationCandidates(data, accountId, startDate, endDate, { 
   const taken = new Set();
   for (const r of data.reconciliations) {
     if (r.id === excludeReconId || r.status !== 'completed' || r.accountId !== accountId) continue;
-    if (reconciliationHealth(data, r).valid) for (const id of r.clearedTxIds) taken.add(id);
+    if (reconciliationHealth(data, r).valid) for (const id of clearedIds(r)) taken.add(id);
   }
   const list = index.txByAccount.get(accountId) || [];
   return list.filter((t) => {
@@ -46,33 +59,40 @@ export function reconciliationCandidates(data, accountId, startDate, endDate, { 
  * @returns {{valid:boolean, problems:Array<{txId,type:'deleted'|'amount'|'date'|'status'|'account',message}>}}
  */
 export function reconciliationHealth(data, rec) {
-  if (rec.status !== 'completed') return { valid: true, problems: [] };
+  if (!rec || rec.status !== 'completed') return { valid: true, problems: [] };
   const index = buildIndex(data);
   const problems = [];
-  for (const s of rec.snapshots) {
+  if (!Array.isArray(rec.snapshots)) {
+    return { valid: false, problems: [{ txId: null, type: 'malformed', message: 'The saved snapshots of this reconciliation are not a list, so it cannot be checked against the ledger.' }] };
+  }
+  rec.snapshots.forEach((s, i) => {
+    if (!isObj(s) || typeof s.txId !== 'string') {
+      problems.push({ txId: null, type: 'malformed', message: `Snapshot #${i + 1} of this reconciliation is malformed and cannot be checked.` });
+      return;
+    }
     const tx = index.txById.get(s.txId);
     if (!tx) {
       problems.push({ txId: s.txId, type: 'deleted', message: `Transaction ${s.txId} was deleted after this reconciliation.` });
-      continue;
+      return;
     }
     if (tx.accountId !== rec.accountId) problems.push({ txId: tx.id, type: 'account', message: `"${tx.description}" was moved to a different account.` });
     if (tx.amountCents !== s.amountCents) problems.push({ txId: tx.id, type: 'amount', message: `"${tx.description}" changed from ${s.amountCents} to ${tx.amountCents} cents.` });
     if (tx.date !== s.date) problems.push({ txId: tx.id, type: 'date', message: `"${tx.description}" moved from ${s.date} to ${tx.date}.` });
     if (tx.status !== 'posted') problems.push({ txId: tx.id, type: 'status', message: `"${tx.description}" is no longer posted.` });
-  }
+  });
   return { valid: problems.length === 0, problems };
 }
 
 /** Completed reconciliations that include a transaction. */
 export function reconciliationsContaining(data, txId) {
-  return data.reconciliations.filter((r) => r.status === 'completed' && r.clearedTxIds.includes(txId));
+  return data.reconciliations.filter((r) => r.status === 'completed' && clearedIds(r).includes(txId));
 }
 
 /** Ids of transactions cleared in any VALID completed reconciliation (their "reconciled" badge). */
 export function reconciledTxIds(data) {
   const out = new Set();
   for (const r of data.reconciliations) {
-    if (r.status === 'completed' && reconciliationHealth(data, r).valid) for (const id of r.clearedTxIds) out.add(id);
+    if (r.status === 'completed' && reconciliationHealth(data, r).valid) for (const id of clearedIds(r)) out.add(id);
   }
   return out;
 }

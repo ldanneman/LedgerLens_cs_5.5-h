@@ -38,9 +38,11 @@ export const fail = (...errors) => ({ ok: false, errors: errors.flat().map((x) =
 export function mutate(data, recipe) {
   let out = {};
   let next;
+  let drafts = 0;
   try {
     next = produce(data, (draft) => {
       out = recipe(draft) || {};
+      drafts = scrubDrafts(draft);
     });
   } catch (e) {
     if (e instanceof OpError) return { ok: false, errors: e.errors };
@@ -55,7 +57,35 @@ export function mutate(data, recipe) {
     };
   }
   const { warnings = [], ...extra } = out;
-  return { ok: true, data: next, warnings, ...extra };
+  const all = drafts ? [...warnings, `${drafts} draft reconciliation${drafts === 1 ? ' was' : 's were'} updated: cleared items that no longer exist, moved account or are no longer posted were removed from ${drafts === 1 ? 'it' : 'them'} and the totals recalculated.`] : warnings;
+  return { ok: true, data: next, warnings: all, ...extra };
+}
+
+/**
+ * Draft hygiene: an in-progress reconciliation is working state, not history, so it may only list posted
+ * transactions of its own account that still exist. After any mutation, entries that stopped qualifying (deleted,
+ * moved to another account, un-posted) are dropped and the draft's calculated/discrepancy are recomputed.
+ * Completed reconciliations are never touched here: they keep their snapshots and show as out of date instead.
+ * @returns {number} how many drafts changed
+ */
+export function scrubDrafts(draft) {
+  if (!Array.isArray(draft.reconciliations) || !Array.isArray(draft.transactions)) return 0;
+  const byId = new Map(draft.transactions.map((t) => [t.id, t]));
+  let changed = 0;
+  for (const r of draft.reconciliations) {
+    if (r.status !== 'in_progress' || !Array.isArray(r.clearedTxIds)) continue;
+    const keep = r.clearedTxIds.filter((id) => {
+      const t = byId.get(id);
+      return t && t.accountId === r.accountId && t.status === 'posted';
+    });
+    if (keep.length === r.clearedTxIds.length) continue;
+    r.clearedTxIds = keep;
+    const sum = keep.reduce((s, id) => s + byId.get(id).amountCents, 0);
+    r.calculatedCents = r.openingCents + sum;
+    r.discrepancyCents = r.closingCents - r.calculatedCents;
+    changed += 1;
+  }
+  return changed;
 }
 
 /** Trim helper that tolerates non-strings. */

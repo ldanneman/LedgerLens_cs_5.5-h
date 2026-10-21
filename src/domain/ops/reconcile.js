@@ -24,7 +24,7 @@ function validatePayload(data, input, excludeId) {
   const taken = new Map();
   for (const r of data.reconciliations) {
     if (r.id === excludeId || r.status !== 'completed' || r.accountId !== input.accountId) continue;
-    if (reconciliationHealth(data, r).valid) for (const t of r.clearedTxIds) taken.set(t, r);
+    if (reconciliationHealth(data, r).valid) for (const t of r.clearedTxIds || []) taken.set(t, r);
   }
   for (const id of ids) {
     const tx = index.txById.get(id);
